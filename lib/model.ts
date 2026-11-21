@@ -83,11 +83,24 @@ export const MODEL: ModelConstants = {
   early_min_rows: 60,
 };
 
+/** The separate, display-only economics of the $10,000 comparison ticket. No rank reads this. */
+export const FARM_ECONOMICS = {
+  deposit_usd: 10_000,
+  drop_share: 0.07,
+  horizon_weeks: 12,
+  gas_events: 9,
+  test_tx_usd: 20,
+  tbill_apr: 0.045,
+  tbill_days: 28,
+  hourly_rate_usd: 25,
+};
+
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
   text: string;
   cost: string;
   time: string;
+  minutes: number;
 }
 
 /** One comparable group: what a category's token-bearing protocols trade at, per dollar of TVL. */
@@ -146,6 +159,22 @@ export interface BoardRow {
   farm_steps: string[];
 }
 
+/** Structured economics for the $10,000 comparison ticket, computed beside the costed steps. */
+export interface FarmEconomics {
+  deposit_usd: number;
+  drop_usd: number;
+  fees_usd: number;
+  net_usd: number;
+  hours: number;
+  net_per_hour: number;
+  hurdle_usd: number;
+  verdict: 'FARM' | 'MARGINAL' | 'SKIP';
+  hold_days: number;
+  gas_band: string;
+  gas_events: number;
+  test_tx_usd: number;
+}
+
 /** The dashboard's compact row: the board row plus the structured farm plan, no duplicated strings. */
 export interface RadarRow {
   rank: number;
@@ -166,6 +195,7 @@ export interface RadarRow {
   comparables: BoardRow['comparables'];
   model: BoardRow['model'];
   steps: FarmStep[];
+  farm: FarmEconomics;
 }
 
 /** A token-bearing protocol, shown apart from the pre-token board as the market's own value. */
@@ -182,6 +212,32 @@ export interface LiveRow {
   age_days: number | null;
   symbol: string | null;
   mcap_tvl: number;
+}
+
+/** One out-of-sample test: every target is scored against a peer set it does not belong to. */
+export interface HeldOutSplit {
+  name: 'leave-one-out' | 'time';
+  n: number;
+  miss_flat: number;
+  miss_core: number;
+  miss_model: number;
+}
+
+/** The held-out comparison, all of it recomputed from the snapshot by main.ts. */
+export interface HeldOutEvidence {
+  metric: string;
+  splits: HeldOutSplit[];
+}
+
+/** The 758-protocol accounting: ranked + token-bearing + excluded, with each exclusion reason. */
+export interface ProtocolLedger {
+  total: number;
+  ranked: number;
+  token_records: number;
+  token_with_mcap: number;
+  token_other: number;
+  excluded: number;
+  reasons: Array<{ reason: string; count: number }>;
 }
 
 /** The dashboard's data: the ranking, the live comparables, the peer book and the model. */
@@ -206,6 +262,19 @@ export interface RadarData {
     live_count: number;
     excluded_products: number;
     categories: number;
+    farm_verdicts: { FARM: number; MARGINAL: number; SKIP: number };
+  };
+  evidence: HeldOutEvidence;
+  ledger: ProtocolLedger;
+  farm_terms: {
+    deposit_usd: number;
+    drop_share: number;
+    horizon_weeks: number;
+    gas_events: number;
+    test_tx_usd: number;
+    tbill_apr: number;
+    tbill_days: number;
+    hourly_rate_usd: number;
   };
   categories: Array<{
     category: string;
@@ -351,6 +420,15 @@ export function familyOf(category: string | null): string {
 /** Whether a protocol is one of the products the watchlist's own rule leaves out. */
 export function isExcludedProduct(p: SnapshotProtocol): boolean {
   return EXCLUDED_CATEGORIES.has(p.category ?? '') || VERSIONED.test(p.name) || WRAPPED.test(p.name) || EXCHANGE.test(p.name);
+}
+
+/** The single reason an excluded product is set aside, in the same priority as the rule above. */
+export function exclusionReason(p: SnapshotProtocol): string {
+  if (EXCLUDED_CATEGORIES.has(p.category ?? '')) return 'Bridge / staking / CEX category';
+  if (VERSIONED.test(p.name)) return 'Versioned pool of another protocol';
+  if (WRAPPED.test(p.name)) return 'Wrapped / staked product';
+  if (EXCHANGE.test(p.name)) return 'Exchange product';
+  return 'Other product rule';
 }
 
 /** Whether a protocol is a subject the board may rank: pre-token, not an exchange, not a versioned or wrapped product. */
@@ -511,11 +589,13 @@ function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
 }
 
-/** A rough gas band for a chain, used only to make a farm step's cost concrete. */
-function gasBand(chain: string): string {
+/** A rough gas band for a chain: the label printed in a step, and its top for the fee ledger. */
+interface GasBand { label: string; high: number }
+function gasBand(chain: string): GasBand {
   const c = chain.toLowerCase();
-  if (c.includes('ethereum')) return '$6-18';
-  if (c.includes('solana')) return 'under $1';
+  const band = (label: string, high: number): GasBand => ({ label, high });
+  if (c.includes('ethereum')) return band('$6-18', 18);
+  if (c.includes('solana')) return band('under $1', 1);
   if (
     c.includes('base') ||
     c.includes('arbitrum') ||
@@ -536,13 +616,13 @@ function gasBand(chain: string): string {
     c.includes('blast') ||
     c.includes('arc')
   ) {
-    return '$1-4';
+    return band('$1-4', 4);
   }
-  if (c.includes('bitcoin')) return '$2-8';
-  if (c.includes('tron')) return '$1-3';
-  if (c.includes('binance') || c.includes('bnb')) return '$0.50-2';
-  if (c.includes('sui') || c.includes('aptos') || c.includes('stellar') || c.includes('algorand') || c.includes('noble')) return 'under $0.50';
-  return '$1-5';
+  if (c.includes('bitcoin')) return band('$2-8', 8);
+  if (c.includes('tron')) return band('$1-3', 3);
+  if (c.includes('binance') || c.includes('bnb')) return band('$0.50-2', 2);
+  if (c.includes('sui') || c.includes('aptos') || c.includes('stellar') || c.includes('algorand') || c.includes('noble')) return band('under $0.50', 0.5);
+  return band('$1-5', 5);
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -639,18 +719,20 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
-  const gas = gasBand(chain);
+  const gas = gasBand(chain).label;
   const ageText = age === null ? 'age not recorded' : `${Math.round(age / 30)} months with no token`;
   return [
     {
       text: `Recon: open ${p.name}'s official app and docs, confirm the record still shows no token, and note the points or pre-token program it runs. Start with only money you can leave for ${hold} days.`,
       cost: 'nothing but 20 minutes of reading',
       time: '20 minutes',
+      minutes: 20,
     },
     {
       text: primaryAction(p, capital, chain),
       cost: `$${capital} of capital plus about ${gas} of gas`,
       time: '15-20 minutes to set up',
+      minutes: 17.5,
     },
     {
       text: secondChain === null
@@ -658,33 +740,69 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
         : `Route funds to ${chain} first; ${secondChain} is the second venue. Use a canonical bridge, test with $20, then move the rest only if the app shows the same pool on both chains.`,
       cost: `${gas} of gas per bridge or approval`,
       time: '20-40 minutes',
+      minutes: 30,
     },
     {
       text: secondAction(p, capital, chain),
       cost: `about ${gas} of gas, no new principal beyond the $${capital} already deployed`,
       time: '15 minutes',
+      minutes: 15,
     },
     {
       text: `Cadence: make one qualifying action every 7 days for 4 weeks (a deposit, borrow, swap or vote). The protocol has been listed since ${p.listed_at ?? 'before DefiLlama tracked it'}, so a four-week record covers more than one observation.`,
       cost: `about ${gas} of gas a week for 4 weeks`,
       time: '10 minutes a week',
+      minutes: 40,
     },
     {
       text: `Hold the principal for at least ${hold} days (${ageText}); do not move it between wallets to chase a snapshot, and keep the receipt or LP token in the same wallet.`,
       cost: `the $${capital} principal stays in the position`,
       time: `${hold} days`,
+      minutes: 0,
     },
     {
       text: `Claim check: use only ${p.name}'s official app for rewards, never pay an upfront claim fee or share a seed phrase, and save the transaction hash with a screenshot of the claim page.`,
       cost: 'no fee to check; normal gas only',
       time: '10 minutes',
+      minutes: 10,
     },
     {
       text: `Exit tripwire: if TVL falls more than 25% below the snapshot's $${Math.round(p.tvl_usd / 1_000_000)}M or the 7-day change drops below -20%, halve the position, re-read the docs, and only re-enter after two stable weeks.`,
       cost: 'normal withdrawal gas, plus slippage on the exit',
       time: '15 minutes to review each week',
+      minutes: 15,
     },
   ];
+}
+
+/**
+ * The economics of a $10,000 comparison ticket, beside (not inside) the costed plan. The drop is the
+ * locked implied value's share times the ticket's fraction of TVL; the fees are the top of the same
+ * gas band the steps print, once per gas event, plus the test transaction those steps ask for.
+ * Hands-on hours are the sum of the steps' own minutes; hold days are not hours. No rank reads this.
+ */
+export function netFarmEconomics(p: SnapshotProtocol, implied: number, age: number | null, plan: FarmStep[]): FarmEconomics {
+  const e = FARM_ECONOMICS;
+  const gas = gasBand(chainOf(p));
+  const fees = gas.high * e.gas_events + e.test_tx_usd;
+  const drop = (implied * e.drop_share * e.deposit_usd) / Math.max(p.tvl_usd, e.deposit_usd);
+  const hours = plan.reduce((sum, step) => sum + step.minutes, 0) / 60;
+  const hurdle = (e.deposit_usd * e.tbill_apr * e.tbill_days) / 365 + hours * e.hourly_rate_usd;
+  const net = drop - fees;
+  return {
+    deposit_usd: e.deposit_usd,
+    drop_usd: Math.round(drop),
+    fees_usd: Math.round(fees),
+    net_usd: Math.round(net),
+    hours: Math.round(hours * 100) / 100,
+    net_per_hour: Math.round((net / Math.max(hours, 0.01)) * 100) / 100,
+    hurdle_usd: Math.round(hurdle),
+    verdict: fees > drop ? 'SKIP' : net > hurdle ? 'FARM' : 'MARGINAL',
+    hold_days: holdDaysFor(age),
+    gas_band: gas.label,
+    gas_events: e.gas_events,
+    test_tx_usd: e.test_tx_usd,
+  };
 }
 
 /** The protocols the board ranks: every watchlist slug plus every pre-token subject, with a safe fallback. */
@@ -788,8 +906,64 @@ export function liveRows(snapshot: Snapshot, limit = 160): LiveRow[] {
     }));
 }
 
+/**
+ * Held-out check of the value model against a flat mcap/TVL multiple. Both predictions see only the
+ * target's peers: leave-one-out removes the target from the whole comparable set; the time split
+ * allows only peers listed strictly earlier. The peer book and deriveValue are called unchanged -
+ * only the peer set handed to them shrinks - so the board's locked formula cannot drift here.
+ */
+export function heldOutEvidence(snapshot: Snapshot, model: ModelConstants = MODEL): HeldOutEvidence {
+  const comparables = snapshot.protocols.filter(isComparable);
+  const rawRatio = (p: SnapshotProtocol): number => p.mcap_usd! / p.tvl_usd;
+  const flatMedian = (target: SnapshotProtocol, peers: SnapshotProtocol[]): number => {
+    const exact = peers.filter((p) => categoryKey(p) === categoryKey(target)).map(rawRatio);
+    if (exact.length >= 3) return median(exact);
+    const family = peers.filter((p) => familyOf(p.category) === familyOf(target.category)).map(rawRatio);
+    if (family.length >= 3) return median(family);
+    return median(peers.map(rawRatio));
+  };
+  const evaluate = (
+    targets: SnapshotProtocol[],
+    peersOf: (target: SnapshotProtocol) => SnapshotProtocol[],
+    name: HeldOutSplit['name'],
+  ): HeldOutSplit => {
+    let flat = 0;
+    let core = 0;
+    let full = 0;
+    let n = 0;
+    for (const target of targets) {
+      const peers = peersOf(target);
+      if (peers.length < model.shrink_weight) continue;
+      const book = buildPeerBook(peers, model);
+      const value = deriveValue(target, snapshot.as_of, book, model);
+      const actual = target.mcap_usd!;
+      flat += Math.abs(Math.log(Math.max(1, target.tvl_usd * flatMedian(target, peers)) / actual));
+      core += Math.abs(Math.log(Math.max(1, target.tvl_usd * value.base_multiple) / actual));
+      full += Math.abs(Math.log(value.implied_value_usd / actual));
+      n += 1;
+    }
+    return {
+      name,
+      n,
+      miss_flat: round4(Math.exp(flat / n)),
+      miss_core: round4(Math.exp(core / n)),
+      miss_model: round4(Math.exp(full / n)),
+    };
+  };
+  const dated = comparables.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : 1));
+  const before = dated.filter((p) => p.listed_at !== null).map((p) => ({ p, list: dated.filter((q) => q.listed_at! < p.listed_at!) }));
+  return {
+    metric: 'exp of mean |log(predicted / market cap)|; lower is better',
+    splits: [
+      evaluate(comparables, (target) => comparables.filter((p) => p.slug !== target.slug), 'leave-one-out'),
+      evaluate(before.map((b) => b.p), (target) => before.find((b) => b.p === target)!.list, 'time'),
+    ],
+  };
+}
+
 /** The dashboard's compact row, with the structured plan instead of the joined strings. */
 function radarRow(row: BoardRow, p: SnapshotProtocol): RadarRow {
+  const plan = farmPlan(p, row.age_days);
   return {
     rank: row.rank,
     slug: row.slug,
@@ -808,7 +982,8 @@ function radarRow(row: BoardRow, p: SnapshotProtocol): RadarRow {
     below_floor: row.below_floor,
     comparables: row.comparables,
     model: row.model,
-    steps: farmPlan(p, row.age_days),
+    steps: plan,
+    farm: netFarmEconomics(p, row.implied_value_usd, row.age_days, plan),
   };
 }
 
@@ -831,6 +1006,24 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const tokenRecorded = snapshot.protocols.length - preToken.length;
   const tokenWithMcap = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0).length;
   const excludedProducts = preToken.filter(isExcludedProduct).length;
+  const reasonCounts = new Map<string, number>();
+  for (const p of preToken) {
+    if (!isExcludedProduct(p)) continue;
+    const reason = exclusionReason(p);
+    reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+  }
+  const ledger: ProtocolLedger = {
+    total: snapshot.protocols.length,
+    ranked: board.length,
+    token_records: tokenRecorded,
+    token_with_mcap: tokenWithMcap,
+    token_other: tokenRecorded - tokenWithMcap,
+    excluded: excludedProducts,
+    reasons: [...reasonCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([reason, count]) => ({ reason, count })),
+  };
+  const rows = board.map((row) => radarRow(row, index.get(row.slug)!));
+  const farmVerdicts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
+  for (const row of rows) farmVerdicts[row.farm.verdict] += 1;
   const rankedByCategory = new Map<string, number>();
   const liveByCategory = new Map<string, number>();
   for (const row of board) rankedByCategory.set(categoryKey(index.get(row.slug)!), (rankedByCategory.get(categoryKey(index.get(row.slug)!)) ?? 0) + 1);
@@ -871,9 +1064,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       live_count: live.length,
       excluded_products: excludedProducts,
       categories: categories.length,
+      farm_verdicts: farmVerdicts,
     },
+    evidence: heldOutEvidence(snapshot, model),
+    ledger,
+    farm_terms: FARM_ECONOMICS,
     categories,
-    rows: board.map((row) => radarRow(row, index.get(row.slug)!)),
+    rows,
     live,
   };
   return { board, radar, book };

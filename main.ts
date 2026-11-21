@@ -139,6 +139,21 @@ const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) fail(`the model wrote a board the gate refuses: ${issue}`);
 
+// The display-only evidence must be real held-out numbers and selective economics, not decoration.
+const splits = radar.evidence.splits;
+if (splits.length !== 2 || splits.some((s) => s.n === 0 || !Number.isFinite(s.miss_flat) || !Number.isFinite(s.miss_model))) {
+  fail('the held-out comparison has an empty or non-finite split');
+}
+const verdicts = radar.stats.farm_verdicts;
+if (verdicts.FARM === 0 || verdicts.MARGINAL === 0 || verdicts.SKIP === 0 || verdicts.FARM > board.length / 2) {
+  fail(`the farm verdicts are not selective: ${JSON.stringify(verdicts)}`);
+}
+const ledger = radar.ledger;
+if (ledger.ranked + ledger.token_records + ledger.excluded !== ledger.total ||
+    ledger.reasons.reduce((sum, r) => sum + r.count, 0) !== ledger.excluded) {
+  fail(`the protocol ledger does not add up: ${JSON.stringify(ledger)}`);
+}
+
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
@@ -166,6 +181,7 @@ if (netIssue !== null) fail(netIssue);
 
 // The screenshots: exactly 3 or 4, whole PNG/JPEG, within the gate's bytes and pixel bounds.
 const shots = copyTree(join(here, 'screenshots'), join(out, 'screenshots'));
+const shotSizes: string[] = [];
 if (shots.length < 3 || shots.length > 4) {
   fail(`screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3 or 4, the board, a detail view and a filtered view`);
 }
@@ -182,6 +198,7 @@ for (const rel of shots) {
   const short = Math.min(size.width, size.height);
   if (long > 1440) fail(`screenshots/${rel} is ${size.width}x${size.height}: its long side is over 1440`);
   if (short < 800) fail(`screenshots/${rel} is ${size.width}x${size.height}: its short side is under 800`);
+  shotSizes.push(`${rel} ${size.width}x${size.height} ${st.size}B`);
 }
 
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
@@ -219,3 +236,8 @@ process.stdout.write(
   `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ` +
     `${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')} (${dossier.length} bytes)\n`,
 );
+process.stdout.write(`token radar: boardIssue ${issue === null ? 'null' : issue}; dashboard source ${dashboardBytes} bytes (cap 62000)\n`);
+process.stdout.write(`token radar: held-out ${splits.map((s) => `${s.name} n=${s.n} flat ${s.miss_flat}× vs 2.1 ${s.miss_model}× (core ${s.miss_core}×)`).join(' | ')}\n`);
+process.stdout.write(`token radar: ledger ${ledger.ranked}+${ledger.token_records}+${ledger.excluded}=${ledger.total}; excluded by reason ${ledger.reasons.map((r) => `${r.reason} ${r.count}`).join(', ')}\n`);
+process.stdout.write(`token radar: farm verdicts FARM ${verdicts.FARM} / MARGINAL ${verdicts.MARGINAL} / SKIP ${verdicts.SKIP} ($${radar.rows[0]!.farm.deposit_usd} ticket)\n`);
+process.stdout.write(`token radar: screenshots ${shotSizes.join(' · ')}\n`);
