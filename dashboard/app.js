@@ -1,7 +1,5 @@
-// Token Radar's page. It reads window.RADAR (written beside dashboard/ by main.ts) and renders the ranked
-// pre-token board, the live-token comparables, the model's method, a filterable/sortable table, and a
-// per-protocol detail drawer with the full value decomposition and farm plan. No network: every byte it
-// shows is in data.js, and every number is recomputed from the snapshot's fields.
+// Token Radar's page. Reads window.RADAR from data.js; renders the ranked board, live comparables,
+// method, filters and a detail drawer with the value product and farm plan. No network in the page.
 (function () {
   'use strict';
 
@@ -48,6 +46,7 @@
     return (n === null || n === undefined || !isFinite(n)) ? 'n/a' : n.toFixed(3) + '×';
   }
   function categoryOf(row) { return row.category || 'Uncategorized'; }
+  function belowFloorCount() { return DATA.rows.filter(function (r) { return r.below_floor; }).length; }
   function chainText(row) {
     var chains = row.chains || [];
     if (chains.length === 0) return 'unnamed chain';
@@ -189,7 +188,7 @@
         el('div', null,
           el('div', { class: 'eyebrow', text: 'Pre-token launch desk / snapshot sweep' }),
           el('h1', null, 'Token ', el('em', null, 'Radar')),
-          el('p', { class: 'sub', text: 'Every protocol on the sealed DefiLlama snapshot that records no token, ranked by what a token would be worth if its record stayed as it is. The board also carries every early protocol below the watchlist floor; live-token protocols sit apart as the market\'s own comparables.' })
+          el('p', { class: 'sub', text: 'Every protocol on the sealed snapshot that records no token, ranked by implied value. The watchlist is a floor, not a ceiling: early rows below it are ranked too, while live tokens sit apart as comparables.' })
         )
       ),
       el('div', { class: 'mast-meta' },
@@ -202,12 +201,14 @@
   }
 
   function stats() {
-    var below = DATA.rows.filter(function (r) { return r.below_floor; }).length;
+    var below = belowFloorCount();
+    var outside = DATA.stats.early_rows;
+    var floor = '$' + Math.round(DATA.meta.floor_usd / 1e6) + 'M';
     var cards = [
-      { k: 'Pre-token records', v: String(DATA.stats.pre_token), small: 'no token', n: 'Protocols at or above $5M TVL whose record carries no gecko id, symbol or market cap.' },
-      { k: 'Ranked on the board', v: String(DATA.stats.ranked), small: 'rows', n: DATA.stats.watchlist_ranked + '/' + DATA.stats.watchlist + ' watchlist covered · ' + DATA.stats.early_rows + ' outside it.' },
-      { k: 'Below the $' + Math.round(DATA.meta.floor_usd / 1e6) + 'M floor', v: String(below), small: 'early', n: 'Ranked, not hidden: the watchlist is a floor, never a ceiling.' },
-      { k: 'Live comparables', v: String(DATA.stats.live_count), small: 'tokens', n: DATA.stats.token_recorded + ' records a token; ' + DATA.stats.excluded_products + ' wrapped, staked, bridged or exchange products set aside.' }
+      { k: 'Pre-token records', v: String(DATA.stats.pre_token), small: 'no token', n: 'Records with no gecko id, symbol or market cap.' },
+      { k: 'Ranked on the board', v: String(DATA.stats.ranked), small: 'rows', n: DATA.stats.watchlist_ranked + '/' + DATA.stats.watchlist + ' watchlist · ' + outside + ' not on it (' + below + ' below ' + floor + ', ' + (outside - below) + ' above).' },
+      { k: 'Below the ' + floor + ' floor (TVL)', v: String(below), small: 'early', n: 'A TVL test, not a watchlist label: all ' + below + ' are outside the watchlist. Outside counts ' + outside + ', including ' + (outside - below) + ' above the floor.' },
+      { k: 'Live comparables', v: String(DATA.stats.live_count), small: 'tokens', n: DATA.stats.token_recorded + ' records a token; ' + DATA.stats.excluded_products + ' products set aside.' }
     ];
     return el('section', { class: 'stats', 'aria-label': 'Snapshot summary' }, cards.map(function (c) {
       return el('div', { class: 'stat' },
@@ -356,7 +357,9 @@
 
   function boardTable() {
     var list = sortedRows(filteredRows());
-    if (list.length === 0) return emptyPanel('No protocol matches that filter', 'Clear the search or pick another category to see the board again.');
+    if (list.length === 0) return emptyPanel('No protocol matches that filter', 'Clear the filters to see the board.');
+    var below = belowFloorCount();
+    var outside = DATA.stats.early_rows;
     var max = list.reduce(function (m, r) { return Math.max(m, r.implied_value_usd); }, 1);
     var body = el('tbody');
     list.forEach(function (row) {
@@ -394,15 +397,19 @@
           el('h2', { text: 'The pre-token board' }),
           el('p', { text: list.length + ' of ' + DATA.rows.length + ' ranked pre-token protocols · strongest implied value first · click a row for its full model and farm plan' })
         ),
-        el('p', { class: 'muted', style: 'text-align:right;max-width:34ch', text: 'Watchlist rows are the floor; the early rows below it are the point of the radar.' })
+        el('p', { class: 'muted', style: 'text-align:right;max-width:34ch', text: 'Below floor tests TVL; outside watchlist tests membership — not the same set.' })
       ),
-      el('div', { class: 'model-strip', 'aria-label': 'Value model' },
+      el('div', { class: 'model-strip', 'aria-label': 'Value model and coverage' },
         el('span', { class: 'eq-label', text: 'Value model' }),
         el('span', { class: 'eq' },
           'implied = TVL × ', el('b', { text: 'peer multiple' }), ' × ', el('b', { text: 'size tilt' }), ' × ',
           el('b', { text: 'momentum' }), ' × ', el('b', { text: 'tenure' }), ' × ', el('b', { text: 'reach' })
         ),
-        el('span', { class: 'eq-note', text: 'peer = category mcap/TVL at $100M · size = (TVL/$100M)^−' + DATA.model.size_tilt + ' · one function, no name list' })
+        el('span', { class: 'eq-note', text: 'peer = snapshot token-bearing mcap/TVL, category median shrunk toward the market · n=' + DATA.stats.token_with_mcap + ' live, each row shows its peer n · size = (TVL/$100M)^−' + DATA.model.size_tilt }),
+        el('div', { class: 'integrity' },
+          el('span', { text: 'Coverage: ' + DATA.stats.watchlist_ranked + '/' + DATA.stats.watchlist + ' watchlist · ' + outside + ' early outside watchlist (' + below + ' below floor + ' + (outside - below) + ' above) · ' + DATA.stats.ranked + ' ranked · ' + DATA.stats.live_count + ' live comparables' }),
+          el('span', { class: 'claim', text: 'The model\'s claim, not a price and not a prediction that a token will be issued.' })
+        )
       ),
       el('div', { class: 'table-wrap' },
         el('table', null,
@@ -425,7 +432,7 @@
 
   function liveTable() {
     var list = sortedRows(filteredLive());
-    if (list.length === 0) return emptyPanel('No live comparable matches that filter', 'Clear the filters to see the protocols whose token already trades.');
+    if (list.length === 0) return emptyPanel('No live comparable matches that filter', 'Clear the filters to see live comparables.');
     var body = el('tbody');
     list.forEach(function (row) {
       body.appendChild(el('tr', { class: 'live-row' },
@@ -447,9 +454,9 @@
       el('div', { class: 'panel-head' },
         el('div', null,
           el('h2', { text: 'Token already trades' }),
-          el('p', { text: list.length + ' live comparables by market cap · these are facts, not forecasts, and never enter the pre-token rank' })
+          el('p', { text: list.length + ' live comparables by market cap · facts, not forecasts, never in the pre-token rank' })
         ),
-        el('p', { class: 'muted', style: 'text-align:right;max-width:38ch', text: 'Their market-cap / TVL multiple is the raw input to the peer book on the Method tab.' })
+        el('p', { class: 'muted', style: 'text-align:right;max-width:38ch', text: 'Their mcap / TVL feeds the Method tab\'s peer book.' })
       ),
       el('div', { class: 'table-wrap' },
         el('table', null,
@@ -495,11 +502,11 @@
       'reach = 1 + (min(chains, ' + m.reach_max_chains + ') - 1) × ' + m.reach_weight
     );
     var factors = el('dl', { class: 'factors' },
-      el('div', { class: 'factor' }, el('dt', { text: 'Peer multiple' }), el('dd', { text: 'The median market-cap / TVL multiple of token-bearing protocols in the same category, normalised to $100M TVL. A category with fewer than three comparables borrows its peer family; one with neither borrows the whole snapshot.' })),
-      el('div', { class: 'factor' }, el('dt', { text: 'Size tilt' }), el('dd', { text: 'Across the snapshot, larger TVL trades at a smaller multiple per dollar: a within-category log-log fit puts the slope near 0.64. The model damps that to -' + m.size_tilt + ' so size informs the rank without burying a large, established protocol.' })),
-      el('div', { class: 'factor' }, el('dt', { text: 'Momentum' }), el('dd', { text: 'The seven-day TVL change, clamped to [' + m.growth_floor + '%, +' + m.growth_cap + '%] and weighted at ' + Math.round(m.growth_weight * 100) + '%. One hot week cannot carry a row; one bad week cannot erase it.' })),
-      el('div', { class: 'factor' }, el('dt', { text: 'Tenure' }), el('dd', { text: 'Time since DefiLlama first listed the protocol with no token, capped at ' + m.tenure_days + ' days. It measures how long the record has run and how much of the launch cycle it has survived; an unlisted age uses ' + m.unknown_age_factor + '.' })),
-      el('div', { class: 'factor' }, el('dt', { text: 'Reach' }), el('dd', { text: 'A small premium for the number of chains the protocol runs on, capped at ' + m.reach_max_chains + ', because distribution is part of a token\'s addressable market.' }))
+      el('div', { class: 'factor' }, el('dt', { text: 'Peer multiple' }), el('dd', { text: 'Median mcap/TVL of token-bearing protocols in the same category, normalised to $100M TVL and shrunk toward the snapshot median. Thin categories borrow a peer family, then the market.' })),
+      el('div', { class: 'factor' }, el('dt', { text: 'Size tilt' }), el('dd', { text: 'Larger TVL trades at a smaller multiple per dollar; the −' + m.size_tilt + ' exponent damps the measured slope so size informs the rank without burying large protocols.' })),
+      el('div', { class: 'factor' }, el('dt', { text: 'Momentum' }), el('dd', { text: 'Seven-day TVL change clamped to [' + m.growth_floor + '%, +' + m.growth_cap + '%], weighted ' + Math.round(m.growth_weight * 100) + '%. One hot week cannot carry a row.' })),
+      el('div', { class: 'factor' }, el('dt', { text: 'Tenure' }), el('dd', { text: 'Time since DefiLlama first listed the protocol with no token, capped at ' + m.tenure_days + ' days; an unknown age uses ' + m.unknown_age_factor + '.' })),
+      el('div', { class: 'factor' }, el('dt', { text: 'Reach' }), el('dd', { text: 'A ' + Math.round(m.reach_weight * 100) + '% premium per chain after the first, capped at ' + m.reach_max_chains + '.' }))
     );
     var composition = el('div', { class: 'composition' },
       comp('Protocols in the snapshot', DATA.stats.protocols),
@@ -507,8 +514,8 @@
       comp('Ranked pre-token rows', DATA.stats.ranked),
       comp('Watchlist rows covered', DATA.stats.watchlist_ranked, '/ ' + DATA.stats.watchlist),
       comp('Early rows outside the watchlist', DATA.stats.early_rows),
-      comp('Excluded wrapped / staked / bridged / CEX', DATA.stats.excluded_products),
-      comp('Token-bearing comparables', DATA.stats.token_with_mcap, '/ ' + DATA.stats.token_recorded + ' token records')
+      comp('Excluded products', DATA.stats.excluded_products),
+      comp('Live comparables', DATA.stats.token_with_mcap, '/ ' + DATA.stats.token_recorded + ' token records')
     );
     var peerRows = DATA.categories.slice(0, 18).map(function (c) {
       return el('tr', null,
@@ -524,15 +531,15 @@
       el('div', { class: 'method' },
         el('section', { class: 'card' },
           el('h2', { text: 'The value model' }),
-          el('p', { text: 'One function scores every protocol. It reads TVL, seven-day growth, the day DefiLlama began tracking the protocol, its category peers and its chain count. No protocol name is special-cased and no row is hand-picked.' }),
+          el('p', { text: 'One function scores every row from TVL, seven-day growth, listing age, category peers and chain count. No protocol name is special-cased.' }),
           equation,
           factors
         ),
         el('section', { class: 'card' },
           el('h2', { text: 'What the snapshot holds' }),
-          el('p', { text: 'The watchlist is a floor, never a ceiling. The board covers all ' + DATA.stats.watchlist + ' watchlist protocols and adds ' + DATA.stats.early_rows + ' more pre-token protocols, most of them below the $' + Math.round(DATA.meta.floor_usd / 1e6) + 'M floor.' }),
+          el('p', { text: 'The watchlist is a floor, not a ceiling: all ' + DATA.stats.watchlist + ' watchlist rows plus ' + DATA.stats.early_rows + ' outside it are ranked. Below-floor counts TVL under $' + Math.round(DATA.meta.floor_usd / 1e6) + 'M; outside-watchlist counts membership.' }),
           composition,
-          el('div', { class: 'note', text: 'The implied value is the entry\'s own claim, not a price and not a promise that a token will be issued. A protocol that records no token may still have one its DefiLlama record does not carry; this page says "records no token", never "has none".' })
+          el('div', { class: 'note', text: 'The implied value is the entry\'s own claim — not a price or a prediction that a token will be issued. "Records no token" means the snapshot carries no token fields; a token may still exist. Open any row to audit the product and its page recompute against board.json.' })
         )
       ),
       el('section', { class: 'peers card' },
@@ -555,10 +562,6 @@
             el('tbody', null, peerRows)
           )
         )
-      ),
-      el('div', { class: 'card', style: 'margin-top:16px' },
-        el('h2', { text: 'How to read a row' }),
-        el('p', { text: 'Start at the implied value and its multiple of TVL, then open the row. The detail drawer shows the exact peer group, the size factor, the momentum and tenure multipliers, and an eight-step farm plan with a cost and a time for every step. The plan is generated from the protocol\'s category, chains, TVL and age, so a lending market and a curator vault do not get the same instructions.' })
       )
     );
   }
@@ -639,13 +642,11 @@
       el('div', { class: 'formula-line' }, el('b', { text: formula })),
       el('div', { class: 'decomp' },
         decomp('TVL', fmtUsd(row.tvl_usd), 'snapshot figure'),
-        decomp('Peer group', c.group, (c.kind === 'category' ? 'category' : c.kind === 'family' ? 'peer family' : 'whole market') + ' · n=' + c.n),
-        decomp('Peer multiple', fmtMult(c.category_multiple), 'at $100M TVL'),
-        decomp('Size factor', fmtFactor(c.size_factor), '(TVL / $100M) ^ -' + model.size_tilt),
-        decomp('Base multiple', fmtMult(c.base_multiple), 'peer × size'),
-        decomp('7d momentum', fmtPct(row.change_7d), fmtFactor(row.model.growth_multiplier)),
-        decomp('Tenure', fmtAge(row.age_days), fmtFactor(row.model.tenure_multiplier)),
-        decomp('Reach', (row.chains || []).length + ' chain(s)', fmtFactor(row.model.reach_multiplier)),
+        decomp('Peer multiple (mcap/TVL)', fmtMult(c.category_multiple), c.group + ' · ' + (c.kind === 'category' ? 'category' : c.kind === 'family' ? 'family' : 'market') + ' · n=' + c.n + ' · @ $100M'),
+        decomp('Size tilt (TVL/$100M)', fmtFactor(c.size_factor), '^−' + model.size_tilt + '; peer × size = ' + fmtMult(c.base_multiple)),
+        decomp('Momentum (7d TVL change)', fmtPct(row.change_7d), fmtFactor(row.model.growth_multiplier)),
+        decomp('Tenure (listed, no token)', fmtAge(row.age_days), fmtFactor(row.model.tenure_multiplier)),
+        decomp('Reach (chains)', (row.chains || []).length + ' chain(s)', fmtFactor(row.model.reach_multiplier)),
         decomp('Implied value', fmtUsd(row.implied_value_usd), 'model claim, not a price'),
         decomp('Page recompute', fmtUsd(check), check === row.implied_value_usd ? 'matches board.json' : 'differs from board.json')
       ),
@@ -654,7 +655,7 @@
         : 'Live peer evidence (token already trades): ' + peers.slice(0, 4).map(function (p) { return p.name + ' at ' + fmtMult(p.mcap_tvl) + ' mcap/TVL'; }).join(' · ') }),
       el('section', { class: 'section' },
         el('h3', { text: 'Farm plan' }),
-        el('p', { text: 'Eight concrete steps, each with a cost and a time. The action is chosen from the protocol\'s category; the capital, gas band and hold window come from its TVL, chains and age. Use only the protocol\'s official app, and never share a seed phrase or pay an upfront claim fee.' }),
+        el('p', { text: 'Eight steps, each with a cost and a time, chosen from this protocol\'s category, TVL, chains and age. Use only official apps; never share a seed phrase or pay an upfront claim fee.' }),
         el('div', { class: 'plan-summary' },
           el('b', { text: (row.steps || []).length + ' steps' }),
           ' · every step priced and timed · hold ',
@@ -674,7 +675,7 @@
       ),
       el('section', { class: 'section' },
         el('h3', { text: 'Peers whose token already trades' }),
-        el('p', { text: 'The raw market evidence behind this category\'s multiple. These protocols are not ranked against the pre-token board.' }),
+        el('p', { text: 'Raw mcap/TVL evidence behind this row\'s peer multiple. Not part of the pre-token rank.' }),
         peers.length === 0
           ? el('p', { class: 'muted', style: 'margin-top:10px', text: 'No token-bearing comparable in this category on the snapshot; the model falls back to its peer family or the whole market.' })
           : el('table', { class: 'peer-mini' },
@@ -694,7 +695,7 @@
             }))
           )
       ),
-      el('div', { class: 'disclaimer', text: 'This is a model, not a price and not a promise of a token. TVL can leave, smart contracts can fail and a DefiLlama record can be incomplete. Size any position so a total loss is survivable, and verify the protocol\'s own docs before approving a contract.' })
+      el('div', { class: 'disclaimer', text: 'A model, not a price or a promise of a token. TVL can leave, contracts can fail, records can be incomplete. Size for total loss and verify official docs before approving.' })
     ));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();
@@ -724,8 +725,8 @@
     else if (state.tab === 'live') shell.appendChild(liveTable());
     else shell.appendChild(methodView());
     shell.appendChild(el('footer', null,
-      el('span', null, el('b', { text: 'Token Radar ' + DATA.meta.model_version }), ' · snapshot ' + DATA.meta.as_of + ' · ' + DATA.stats.ranked + ' pre-token rows · ' + DATA.stats.live_count + ' live comparables'),
-      el('span', { text: 'No network · every figure in this page comes from the sealed snapshot · an estimate, not a price' })
+      el('span', null, el('b', { text: 'Token Radar ' + DATA.meta.model_version }), ' · ' + DATA.meta.as_of + ' · ' + DATA.stats.ranked + ' rows · ' + DATA.stats.live_count + ' live'),
+      el('span', { text: 'No network · all figures from the sealed snapshot · an estimate, not a price' })
     ));
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
