@@ -1,60 +1,38 @@
-# Token Radar — the value model behind the board
+# Token Radar — model radar-3.1
 
-Snapshot **2026-11-14** · DefiLlama protocol index (758 protocols at or above $5M TVL) · watchlist floor
-**$50,000,000** · model **radar-2.1**.
+Snapshot 2026-11-14 · sealed DefiLlama protocol index · watchlist floor $50M. All numbers below are recomputed at run time from `radar.validation`, `radar.stats` and `radar.model` in `data.js`.
 
-## What is ranked
-
-The board ranks **pre-token protocols**: snapshot records with no market cap, no CoinGecko id and no
-symbol. It covers all **40** watchlist protocols and adds **158** more, for **198** rows; **138** are below
-the floor, because the watchlist is the floor, never the ceiling. Token-bearing protocols are kept out of
-the rank and shown apart as live comparables (**128** with a usable market cap).
-
-Of the snapshot's **342** pre-token records, **144** are set aside as CEX, bridge, liquid-staking,
-liquid-restaking, restaked-BTC, versioned, wrapped/staked or exchange products.
-
-## The function
-
-`deriveValue` in `lib/model.ts` scores every row from the snapshot's own figures only:
+## Formula
 
 ```
-implied = TVL × peer multiple × size tilt × momentum × tenure × reach
+launch  = TVL × peer × size × momentum × tenure × reach
+implied = launch × odds × share
+        = TVL × peer × size × momentum × tenure × reach × odds × share
 ```
 
-- **peer multiple** — the median market-cap/TVL of token-bearing protocols in the same category,
-  normalised to $100M TVL, shrunk toward the whole snapshot's median with 6 pseudo-observations. A
-  category with fewer than three comparables borrows its peer family; a family with fewer than three
-  borrows the whole snapshot.
-- **size tilt** — `(TVL / $100M) ^ -0.28`; a within-category log-log fit puts the raw market slope near
-  0.64, damped so size informs the rank without burying a large protocol.
-- **momentum** — `1 + clamp(change_7d, -40, 80) / 100 × 0.25`; one hot week cannot carry a row.
-- **tenure** — `0.60 + min(age_days, 1460) / 1460 × 0.40`; an unlisted age uses 0.68.
-- **reach** — `1 + (min(chains, 6) - 1) × 0.02`; distribution is part of a token's addressable market.
+- **peer** — category median mcap/TVL at $100M TVL, shrunk toward the market; thin categories borrow their peer family, then the whole snapshot.
+- **size** — `(TVL / $100M) ^ −(1 − slope)`; the slope is fitted by OLS on log(mcap) vs log(TVL) over token-bearing, non-excluded protocols.
+- **momentum** — `1 + clamp(change_7d, −40, +80) / 100 × 0.25`.
+- **tenure** — `0.60 + min(age_days, 1460) / 1460 × 0.40`; unknown age uses 0.68.
+- **reach** — `1 + (min(chains, 6) − 1) × 0.02`.
+- **odds** — the group's share of protocols already recording a token, reduced for age without one and lifted slightly by positive 7d change, clamped to [0.05, 0.95].
+- **share** — shrunk median of `mcap / (mcap + TVL)` in the comparable group, clamped to [0.05, 0.95].
 
-The result is rounded to a whole dollar and floored at $1. The board carries every multiplier for every
-row, and the detail drawer recomputes the value from the row's own fields, so the page and `board.json`
-show the same arithmetic.
+The board carries every factor per row; the detail view recomputes both launch and implied from those fields and checks them against `board.json`. Ranking is by `implied_value_usd` only, never by verdict.
 
-## Farm plans
+## Blind tests of the fitted size curve
 
-`farmPlan` writes **eight** steps per protocol. The action comes from the category: lending gets a
-supply/borrow leg, DEXs and yield a LP position, curators a vault deposit, RWA a subscription and
-redemption test, derivatives a hedged margin position, staking a stake and a second operator, chains a
-bridge/swap/vote, and so on. Capital comes from TVL, the gas band from the first chain, the hold window
-from age. Every step states a **cost** and a **time** and ends with an exit tripwire.
+| test | curve log error | flat log error | Spearman curve / flat |
+| --- | ---: | ---: | ---: |
+| walk-forward (n=92, train 49, test 43) | 1.3914 | 1.7182 | 0.312 / 0.312 |
+| leave-one-category-out (5 categories, 50 rows) | 1.2847 | 1.4153 | 0.5357 / 0.5357 |
 
-## What the board is not
+The curve is kept only when it matches or beats a flat median mcap/TVL baseline on both held-out tests. Fitted slope 0.394, size tilt 0.606. No test uses a future-fitted parameter.
 
-The implied value is the entry's own claim, not a price and not a prediction that a token will be issued.
-A protocol that records no token may still have one its DefiLlama record does not carry; the page says
-"records no token", never "has none". TVL can leave, contracts can fail and a comparable set can be thin.
+## Verdict rule
 
-## Top of this snapshot
+FARM if `odds ≥ 0.50` **and** implied is at or above the board median (`percentile ≥ 0.50`). SKIP if `odds ≤ 0.20` **or** implied is in the bottom quartile (`percentile ≤ 0.25`). THIN otherwise. Current board: **50 FARM / 89 THIN / 59 SKIP**; all 40 watchlist rows are ranked alongside 158 early rows, with 128 live comparables kept out of the rank. The plan's $50–$500 capital is never an input to a verdict: implied/capital is in the thousands for every row.
 
-| # | Protocol | Category | TVL | Implied |
-| ---: | --- | --- | ---: | ---: |
-| 1 | Steakhouse Financial | Risk Curators | $2.75B | $112.3M |
-| 2 | Sentora Curator | Risk Curators | $2.76B | $104.1M |
-| 3 | Gauntlet | Risk Curators | $1.58B | $76.7M |
-| 4 | Veda | Onchain Capital Allocator | $1.56B | $76.0M |
-| 5 | USDD | CDP | $1.06B | $74.4M |
+## What is not claimed
+
+Not a price, not a promise that a token will be issued, and not a backtest of farm returns. "Records no token" never means "has none"; TVL can leave, contracts can fail, comparable sets can be thin. Farm steps are a costed, timed checklist from the protocol's own category, chains, TVL and age — not a guarantee of an airdrop.

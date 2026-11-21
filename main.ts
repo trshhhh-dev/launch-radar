@@ -201,20 +201,39 @@ writeFileSync(join(out, 'dossier.json'), dossier);
 
 const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 const rows = board.slice(0, 15);
+const v = radar.validation;
 process.stdout.write(
-  `token radar ${radar.meta.model_version}: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ` +
-    `${radar.stats.pre_token} pre-token records, ${board.length} ranked (${radar.stats.early_rows} outside the watchlist), ` +
-    `${radar.stats.token_with_mcap} live comparables\n`,
+  `token radar ${radar.meta.model_version}: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist ` +
+    `(${radar.stats.watchlist_ranked} ranked), ${radar.stats.pre_token} pre-token records, ${board.length} ranked ` +
+    `(${radar.stats.early_rows} outside the watchlist), ${radar.stats.token_with_mcap} live comparables\n`,
 );
+process.stdout.write(
+  `token radar: validation ${v.size_curve_kept ? 'size curve KEPT' : 'size curve DROPPED'}: ` +
+    `n=${v.n}, slope=${v.slope}, intercept=${v.intercept}, size_tilt=${v.size_tilt}\n`,
+);
+process.stdout.write(
+  `token radar:   walk-forward n_train=${v.walk_forward.n_train} n_test=${v.walk_forward.n_test} ` +
+    `curve(spearman=${v.walk_forward.curve.spearman}, logerr=${v.walk_forward.curve.median_abs_log_error}) ` +
+    `flat(spearman=${v.walk_forward.flat.spearman}, logerr=${v.walk_forward.flat.median_abs_log_error}) kept=${v.walk_forward.kept}\n`,
+);
+process.stdout.write(
+  `token radar:   leave-one-category-out n_scored=${v.loco.n_scored} across ${v.loco.categories.length} categories ` +
+    `curve(spearman=${v.loco.curve.spearman}, logerr=${v.loco.curve.median_abs_log_error}) ` +
+    `flat(spearman=${v.loco.flat.spearman}, logerr=${v.loco.flat.median_abs_log_error}) kept=${v.loco.kept}\n`,
+);
+const dropped = Object.entries(v.terms).filter(([, on]) => !on).map(([name]) => name);
+process.stdout.write(`token radar:   terms ${Object.keys(v.terms).join(', ')}; dropped ${dropped.length === 0 ? 'none' : dropped.join(', ')}\n`);
 process.stdout.write('token radar: top 15 by implied value\n');
 for (const row of rows) {
   const flag = row.watchlist ? 'W' : row.below_floor ? 'early' : 'above';
   process.stdout.write(
     `  ${String(row.rank).padStart(2)}  ${row.name.slice(0, 30).padEnd(30)} ${(row.category ?? 'Uncategorized').slice(0, 24).padEnd(24)} ` +
       `${usd.format(row.tvl_usd).padStart(13)} TVL  ${usd.format(row.implied_value_usd).padStart(13)} implied  ` +
-      `${(row.implied_multiple * 100).toFixed(1).padStart(5)}% of TVL  ${flag}\n`,
+      `${(row.implied_multiple * 100).toFixed(1).padStart(5)}% of TVL  ` +
+      `odds ${row.token_odds.toFixed(2)}  share ${row.own_share.toFixed(2)}  ${row.verdict.padEnd(4)}  ${flag}\n`,
   );
 }
+process.stdout.write(`token radar: boardIssue: ${String(issue)}\n`);
 process.stdout.write(
   `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ` +
     `${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')} (${dossier.length} bytes)\n`,

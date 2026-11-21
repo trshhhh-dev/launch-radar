@@ -1,21 +1,31 @@
 // The token radar's model: one sealed snapshot in, one ranked board out, every number derived from the
 // snapshot's own figures. No protocol name is special-cased and no row is hand-picked.
 //
-// The model has four moving parts, each stated on the dashboard and shown per row:
+// The model has six moving parts, each stated on the dashboard and shown per row:
 //
-//   1. peer multiple   the median market-cap / TVL multiple of the protocols in the same category whose
-//                      token already trades, normalised to a $100M-TVL reference and shrunk toward the
-//                      whole snapshot's median while a category has few comparables;
-//   2. size tilt       across the snapshot's token-bearing protocols a larger TVL trades at a smaller
-//                      multiple per dollar, so the peer multiple is scaled by (tvl / $100M) ^ -0.28;
-//   3. momentum        the seven-day TVL change, clamped to [-40%, +80%] and weighted at 25%;
-//   4. tenure + reach  time since DefiLlama first listed the protocol with no token (maturity), and a
-//                      small premium for the number of chains the protocol runs on.
+//   1. peer multiple   the token-bearing, non-excluded protocols in the same category (else peer family,
+//                      else whole snapshot) give a size curve log(mcap) = intercept + slope x log(TVL),
+//                      fitted by ordinary least squares on the snapshot; each category's intercept is
+//                      shrunk toward the global fit while it has few points. The implied multiple at a
+//                      protocol's TVL is the curve's mcap/TVL. The curve is blind-tested walk-forward
+//                      and leave-one-category-out against a flat median multiple (radar.validation);
+//   2. momentum        the seven-day TVL change, clamped to [-40%, +80%] and weighted at 25%;
+//   3. tenure          time since DefiLlama first listed the protocol with no token (maturity);
+//   4. reach           a small premium for the number of chains the protocol runs on;
+//   5. token odds      the share of non-excluded protocols in the same category (else family, else
+//                      market) that already record a token, adjusted down for age without a token and
+//                      slightly up for positive 7-day TVL change, clamped to [0.05, 0.95];
+//   6. own-token share the shrunk median of mcap / (mcap + TVL) among the protocol's comparable group:
+//                      the share of protocol value that accrued to the token where one already trades.
 //
-// Implied value is therefore: TVL x peer multiple x size tilt x momentum x tenure x reach. It is a
-// model's claim about what a token would be worth if the protocol's record stayed as it is, never a
-// promise that a token will be issued. Token-bearing protocols are kept out of the ranked board and
-// shown apart as the market's own comparables.
+//   launch = TVL x peer multiple x size factor x momentum x tenure x reach
+//   implied = max(1, round(launch x token odds x own-token share))
+//
+// Implied value is a model's claim about what a token would be worth if the protocol's record stayed as
+// it is, never a promise that a token will be issued. Token-bearing protocols are kept out of the
+// ranked board and shown apart as the market's own comparables. Every row also carries a FARM / THIN /
+// SKIP verdict from token odds and the row's implied-value standing (percentile and multiple of the
+// board median), never from the farm plan's capital: capital is a cost, not a measure of value.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -60,11 +70,28 @@ export interface ModelConstants {
   board_min_rows: number;
   board_max_rows: number;
   early_min_rows: number;
+  min_group: number;
+  odds_min: number;
+  odds_max: number;
+  odds_age_days: number;
+  odds_age_penalty: number;
+  odds_momentum_boost: number;
+  share_min: number;
+  share_max: number;
+  share_shrink_weight: number;
+  verdict_farm_min_odds: number;
+  verdict_farm_min_percentile: number;
+  verdict_skip_max_odds: number;
+  verdict_skip_max_percentile: number;
+  walk_forward_train: number;
+  loco_min_category: number;
+  loco_min_others: number;
 }
 
 export const MODEL: ModelConstants = {
-  version: 'radar-2.1',
+  version: 'radar-3.1',
   reference_tvl_usd: 100_000_000,
+  // Fallback prior only: buildRadar replaces size_tilt with the slope fitted from the snapshot (1 - b).
   size_tilt: 0.28,
   shrink_weight: 6,
   growth_weight: 0.25,
@@ -81,6 +108,85 @@ export const MODEL: ModelConstants = {
   board_min_rows: 100,
   board_max_rows: 4000,
   early_min_rows: 60,
+  min_group: 3,
+  odds_min: 0.05,
+  odds_max: 0.95,
+  odds_age_days: 1460,
+  odds_age_penalty: 0.3,
+  odds_momentum_boost: 0.1,
+  share_min: 0.05,
+  share_max: 0.95,
+  share_shrink_weight: 6,
+  // Verdict rule: FARM when odds >= 0.50 and implied >= the board median (percentile >= 0.50);
+  // SKIP when odds <= 0.20 or implied is in the bottom quartile (percentile <= 0.25); THIN otherwise.
+  verdict_farm_min_odds: 0.5,
+  verdict_farm_min_percentile: 0.5,
+  verdict_skip_max_odds: 0.2,
+  verdict_skip_max_percentile: 0.25,
+  walk_forward_train: 0.7,
+  loco_min_category: 5,
+  loco_min_others: 10,
+}
+
+/** The snapshot's size curve: log(mcap) = intercept + slope x log(TVL), fitted by OLS on the comparables. */
+export interface SizeCurve {
+  n: number;
+  slope: number;
+  intercept: number;
+  /** The exponent the dashboard states: size factor = (TVL / $100M) ^ -size_tilt, where size_tilt = 1 - slope. */
+  size_tilt: number;
+  kept: boolean;
+}
+
+/** One blind test's score: Spearman rank correlation and median absolute log error. */
+export interface TestMetrics {
+  n: number;
+  spearman: number;
+  median_abs_log_error: number;
+}
+
+/** One leave-one-category-out fold. */
+export interface LocoCategory {
+  category: string;
+  n: number;
+  curve: TestMetrics;
+  flat: TestMetrics;
+}
+
+/** The size curve's blind tests, computed at run time from the same snapshot. Plain JSON-safe data. */
+export interface Validation {
+  n: number;
+  slope: number;
+  intercept: number;
+  size_tilt: number;
+  size_curve_kept: boolean;
+  walk_forward: {
+    n_train: number;
+    n_test: number;
+    curve: TestMetrics;
+    flat: TestMetrics;
+    kept: boolean;
+  };
+  loco: {
+    categories: LocoCategory[];
+    n_scored: number;
+    curve: TestMetrics;
+    flat: TestMetrics;
+    kept: boolean;
+  };
+  terms: {
+    size_curve: boolean;
+    momentum: boolean;
+    tenure: boolean;
+    reach: boolean;
+    token_odds: boolean;
+    own_share: boolean;
+  };
+  formulas: {
+    size_curve: string;
+    token_odds: string;
+    own_share: string;
+  };
 };
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -90,6 +196,9 @@ export interface FarmStep {
   time: string;
 }
 
+/** The plan's verdict, from odds and implied-value standing (not its capital). */
+export type Verdict = 'FARM' | 'THIN' | 'SKIP';
+
 /** One comparable group: what a category's token-bearing protocols trade at, per dollar of TVL. */
 export interface PeerComparable {
   category: string;
@@ -98,15 +207,21 @@ export interface PeerComparable {
   n: number;
   median_ratio: number;
   multiple: number;
+  flat_multiple: number;
 }
 
-/** The whole snapshot's peer book: every category's comparable multiple, normalised to the reference TVL. */
+/** The whole snapshot's peer book: every category's comparable multiple and the fitted size curve. */
 export interface PeerBook {
   reference_tvl_usd: number;
   global_n: number;
   global_median_ratio: number;
   global_multiple: number;
   categories: Map<string, PeerComparable>;
+  curve: SizeCurve;
+  category_groups: Map<string, SnapshotProtocol[]>;
+  family_groups: Map<string, SnapshotProtocol[]>;
+  all: SnapshotProtocol[];
+  min_group: number;
 }
 
 /** One row of board.json: the ranked board's row, with its model breakdown. */
@@ -128,6 +243,10 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   implied_multiple: number;
+  launch_value_usd: number;
+  verdict: Verdict;
+  token_odds: number;
+  own_share: number;
   comparables: {
     group: string;
     kind: 'category' | 'family' | 'market';
@@ -136,12 +255,17 @@ export interface BoardRow {
     category_multiple: number;
     size_factor: number;
     base_multiple: number;
+    flat_multiple: number;
+    curve_multiple: number;
+    size_curve_kept: boolean;
   };
   model: {
     growth_pct: number;
     growth_multiplier: number;
     tenure_multiplier: number;
     reach_multiplier: number;
+    token_odds: number;
+    own_share: number;
   };
   farm_steps: string[];
 }
@@ -161,6 +285,10 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   implied_multiple: number;
+  launch_value_usd: number;
+  verdict: Verdict;
+  token_odds: number;
+  own_share: number;
   watchlist: boolean;
   below_floor: boolean;
   comparables: BoardRow['comparables'];
@@ -194,6 +322,7 @@ export interface RadarData {
     generated: string;
   };
   model: ModelConstants;
+  validation: Validation;
   stats: {
     protocols: number;
     watchlist: number;
@@ -358,81 +487,315 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && !isExcludedProduct(p);
 }
 
-/** A token-bearing protocol with a usable market cap and TVL. */
+/** A token-bearing protocol with a usable market cap and TVL, not one of the products the watchlist sets aside. */
 function isComparable(p: SnapshotProtocol): boolean {
-  return p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0;
+  return p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && !isExcludedProduct(p);
+}
+
+/** The comparables the size curve is fitted on: token-bearing, usable figures, not excluded products. */
+export function comparableProtocols(protocols: SnapshotProtocol[]): SnapshotProtocol[] {
+  return protocols.filter(isComparable);
+}
+
+interface Ols {
+  a: number;
+  b: number;
+  n: number;
+}
+
+/** Ordinary least squares of log(mcap) on log(TVL). */
+function ols(points: SnapshotProtocol[]): Ols {
+  const n = points.length;
+  if (n < 2) return { a: 0, b: 0, n };
+  const xs = points.map((p) => Math.log(p.tvl_usd));
+  const ys = points.map((p) => Math.log(p.mcap_usd!));
+  let sx = 0;
+  let sy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i]!;
+    sy += ys[i]!;
+  }
+  const mx = sx / n;
+  const my = sy / n;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sxx += (xs[i]! - mx) ** 2;
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+  }
+  if (sxx <= 0) return { a: my, b: 0, n };
+  const b = sxy / sxx;
+  return { a: my - b * mx, b, n };
+}
+
+function sizeCurveFromFit(fit: Ols, kept: boolean): SizeCurve {
+  return {
+    n: fit.n,
+    slope: round4(fit.b),
+    intercept: round4(fit.a),
+    size_tilt: round4(kept ? 1 - fit.b : 0),
+    kept,
+  };
+}
+
+/** The flat baseline's multiple: the median mcap/TVL of a training set. */
+function flatMultiple(points: SnapshotProtocol[]): number {
+  if (points.length === 0) return 0.2;
+  return median(points.map((p) => p.mcap_usd! / p.tvl_usd));
+}
+
+function predictCurve(points: SnapshotProtocol[], fit: Ols): number[] {
+  return points.map((p) => Math.exp(fit.a + fit.b * Math.log(p.tvl_usd)));
+}
+
+function predictFlat(points: SnapshotProtocol[], multiple: number): number[] {
+  return points.map((p) => p.tvl_usd * multiple);
+}
+
+/** Median absolute log error of predicted mcap against actual mcap. */
+function medianAbsLogError(predicted: number[], actual: number[]): number {
+  if (predicted.length === 0) return 0;
+  return median(predicted.map((v, i) => Math.abs(Math.log(Math.max(1e-9, v) / Math.max(1e-9, actual[i]!)))));
+}
+
+/** Spearman rank correlation, with average ranks for ties. */
+function spearman(x: number[], y: number[]): number {
+  const n = x.length;
+  if (n < 2) return 0;
+  const ranks = (values: number[]): number[] => {
+    const order = values.map((v, i) => [v, i] as const).sort((p, q) => p[0] - q[0]);
+    const out = new Array<number>(n);
+    let i = 0;
+    while (i < n) {
+      let j = i;
+      while (j + 1 < n && order[j + 1]![0] === order[i]![0]) j++;
+      const rank = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) out[order[k]![1]] = rank;
+      i = j + 1;
+    }
+    return out;
+  };
+  const rx = ranks(x);
+  const ry = ranks(y);
+  const mx = rx.reduce((s, v) => s + v, 0) / n;
+  const my = ry.reduce((s, v) => s + v, 0) / n;
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < n; i++) {
+    num += (rx[i]! - mx) * (ry[i]! - my);
+    dx += (rx[i]! - mx) ** 2;
+    dy += (ry[i]! - my) ** 2;
+  }
+  return dx > 0 && dy > 0 ? num / Math.sqrt(dx * dy) : 0;
+}
+
+function testMetrics(predicted: number[], actual: number[]): TestMetrics {
+  return {
+    n: predicted.length,
+    spearman: round4(spearman(predicted, actual)),
+    median_abs_log_error: round4(medianAbsLogError(predicted, actual)),
+  };
 }
 
 /**
- * The peer book: for every category in the snapshot, the median market-cap/TVL multiple of its
- * token-bearing protocols, normalised to the reference TVL (so the size tilt can be applied once,
- * later), then shrunk toward the whole snapshot's median by `shrink_weight` pseudo-observations.
- *
- * A category with at least three comparables stands on its own; a thinner one borrows its peer
+ * The size curve's blind tests, computed at run time from the same snapshot. Walk-forward trains on the
+ * earlier ~70% by listed_at (unknown dates last) and scores the rest; leave-one-category-out trains on
+ * the other categories and scores each category with enough points. The curve is kept only when the
+ * walk-forward score is at least as good as a flat median mcap/TVL baseline.
+ */
+export function validateSizeCurve(
+  comparables: SnapshotProtocol[],
+  model: ModelConstants = MODEL,
+): { curve: SizeCurve; validation: Validation } {
+  const fit = ols(comparables);
+  const known = comparables
+    .filter((p) => p.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : 1));
+  const unknown = comparables.filter((p) => p.listed_at === null);
+  let train = known.slice(0, Math.floor(known.length * model.walk_forward_train));
+  let test = known.slice(train.length).concat(unknown);
+  if (train.length < 2 || test.length === 0) {
+    train = comparables;
+    test = comparables;
+  }
+  const trainFit = ols(train);
+  const actual = test.map((p) => p.mcap_usd!);
+  const curveMetrics = testMetrics(predictCurve(test, trainFit), actual);
+  const flat = flatMultiple(train);
+  const flatMetrics = testMetrics(predictFlat(test, flat), actual);
+  const kept =
+    curveMetrics.spearman >= flatMetrics.spearman - 1e-9 &&
+    curveMetrics.median_abs_log_error <= flatMetrics.median_abs_log_error + 1e-9;
+
+  const byCategory = new Map<string, SnapshotProtocol[]>();
+  for (const p of comparables) {
+    const cat = categoryKey(p);
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat)!.push(p);
+  }
+  const locoCategories: LocoCategory[] = [];
+  for (const [cat, points] of byCategory) {
+    if (points.length < model.loco_min_category) continue;
+    const others = comparables.filter((p) => categoryKey(p) !== cat);
+    if (others.length < model.loco_min_others) continue;
+    const otherFit = ols(others);
+    const otherFlat = flatMultiple(others);
+    locoCategories.push({
+      category: cat,
+      n: points.length,
+      curve: testMetrics(predictCurve(points, otherFit), points.map((p) => p.mcap_usd!)),
+      flat: testMetrics(predictFlat(points, otherFlat), points.map((p) => p.mcap_usd!)),
+    });
+  }
+  locoCategories.sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+  const nScored = locoCategories.reduce((s, c) => s + c.n, 0);
+  const aggregate = (pick: (c: LocoCategory) => TestMetrics): TestMetrics => {
+    if (nScored === 0) return { n: 0, spearman: 0, median_abs_log_error: 0 };
+    let sp = 0;
+    let ml = 0;
+    for (const c of locoCategories) {
+      sp += pick(c).spearman * c.n;
+      ml += pick(c).median_abs_log_error * c.n;
+    }
+    return { n: nScored, spearman: round4(sp / nScored), median_abs_log_error: round4(ml / nScored) };
+  };
+  const locoCurve = aggregate((c) => c.curve);
+  const locoFlat = aggregate((c) => c.flat);
+  const locoKept =
+    locoCurve.spearman >= locoFlat.spearman - 1e-9 &&
+    locoCurve.median_abs_log_error <= locoFlat.median_abs_log_error + 1e-9;
+
+  const curve = sizeCurveFromFit(fit, kept);
+  const validation: Validation = {
+    n: fit.n,
+    slope: curve.slope,
+    intercept: curve.intercept,
+    size_tilt: curve.size_tilt,
+    size_curve_kept: kept,
+    walk_forward: { n_train: train.length, n_test: test.length, curve: curveMetrics, flat: flatMetrics, kept },
+    loco: { categories: locoCategories, n_scored: nScored, curve: locoCurve, flat: locoFlat, kept: locoKept },
+    terms: {
+      size_curve: kept,
+      momentum: true,
+      tenure: true,
+      reach: true,
+      token_odds: true,
+      own_share: true,
+    },
+    formulas: {
+      size_curve:
+        'log(mcap) = intercept + slope x log(TVL), ordinary least squares on token-bearing, non-excluded protocols; category intercepts shrunk toward the global fit with 6 pseudo-observations; size factor = (TVL / $100M) ^ -(1 - slope).',
+      token_odds:
+        'odds = clamp(0.05, 0.95, base x (1 - 0.30 x min(age_days, 1460) / 1460) x (1 + 0.10 x clamp(change_7d, 0, 80) / 80)); base is the share of non-excluded protocols in the category (else family, else market) that already record a token.',
+      own_share:
+        "share = clamp(0.05, 0.95, shrunk median of mcap / (mcap + TVL) among the protocol's comparable group, shrunk toward the whole snapshot with 6 pseudo-observations).",
+    },
+  };
+  return { curve, validation };
+}
+
+/**
+ * The peer book: for every category, the size curve's multiple at the reference TVL (or the flat shrunk
+ * median when the curve failed its blind test), plus the groups the own-token share is taken from.
+ * A category with at least `min_group` comparables stands on its own; a thinner one borrows its peer
  * family; one with neither borrows the whole market. No name is ever consulted.
  */
-export function buildPeerBook(protocols: SnapshotProtocol[], model: ModelConstants = MODEL): PeerBook {
-  const comparable = protocols.filter(isComparable);
-  const normalised = (p: SnapshotProtocol): number => {
-    const raw = p.mcap_usd! / p.tvl_usd;
-    return clamp(raw * Math.pow(p.tvl_usd / model.reference_tvl_usd, model.size_tilt), 0.01, 4);
-  };
-  const all = comparable.map(normalised);
-  const globalMedian = all.length === 0 ? 0.2 : median(all);
+export function buildPeerBook(
+  protocols: SnapshotProtocol[],
+  model: ModelConstants = MODEL,
+  curve?: SizeCurve,
+): PeerBook {
+  const comparable = comparableProtocols(protocols);
+  const fit = curve ?? sizeCurveFromFit(ols(comparable), comparable.length >= 2);
+  const globalMedian = comparable.length === 0 ? 0.2 : median(comparable.map((p) => p.mcap_usd! / p.tvl_usd));
 
-  const byCategory = new Map<string, number[]>();
-  const byFamily = new Map<string, number[]>();
+  const categoryGroups = new Map<string, SnapshotProtocol[]>();
+  const familyGroups = new Map<string, SnapshotProtocol[]>();
   for (const p of comparable) {
     const cat = categoryKey(p);
     const fam = familyOf(p.category);
-    const value = normalised(p);
-    if (!byCategory.has(cat)) byCategory.set(cat, []);
-    byCategory.get(cat)!.push(value);
-    if (!byFamily.has(fam)) byFamily.set(fam, []);
-    byFamily.get(fam)!.push(value);
+    if (!categoryGroups.has(cat)) categoryGroups.set(cat, []);
+    categoryGroups.get(cat)!.push(p);
+    if (!familyGroups.has(fam)) familyGroups.set(fam, []);
+    familyGroups.get(fam)!.push(p);
+  }
+
+  const groupFor = (cat: string, family: string): { kind: PeerComparable['kind']; points: SnapshotProtocol[] } => {
+    const exact = categoryGroups.get(cat) ?? [];
+    if (exact.length >= model.min_group) return { kind: 'category', points: exact };
+    const fam = familyGroups.get(family) ?? [];
+    if (fam.length >= model.min_group) return { kind: 'family', points: fam };
+    return { kind: 'market', points: comparable };
+  };
+
+  // Each category's intercept, shrunk toward the global fit while the category has few points.
+  const intercepts = new Map<string, number>();
+  const keys = new Set<string>(protocols.map(categoryKey));
+  for (const cat of keys) {
+    const points = categoryGroups.get(cat) ?? [];
+    if (points.length === 0) {
+      intercepts.set(cat, fit.intercept);
+      continue;
+    }
+    let meanResidual = 0;
+    for (const p of points) meanResidual += Math.log(p.mcap_usd!) - fit.slope * Math.log(p.tvl_usd);
+    meanResidual /= points.length;
+    intercepts.set(cat, (points.length * meanResidual + model.shrink_weight * fit.intercept) / (points.length + model.shrink_weight));
   }
 
   const categories = new Map<string, PeerComparable>();
-  const keys = new Set<string>(protocols.map(categoryKey));
   for (const cat of keys) {
-    const exact = byCategory.get(cat) ?? [];
-    let kind: PeerComparable['kind'] = 'market';
-    let sample = all;
-    if (exact.length >= 3) {
-      kind = 'category';
-      sample = exact;
-    } else {
-      const familySample = byFamily.get(familyOf(cat === 'Uncategorized' ? null : cat)) ?? [];
-      if (familySample.length >= 3) {
-        kind = 'family';
-        sample = familySample;
-      }
-    }
-    const med = sample.length === 0 ? globalMedian : median(sample);
-    const multiple =
-      kind === 'market' || sample.length === 0
+    const family = familyOf(cat === 'Uncategorized' ? null : cat);
+    const { kind, points } = groupFor(cat, family);
+    const med = points.length === 0 ? globalMedian : median(points.map((p) => p.mcap_usd! / p.tvl_usd));
+    const flat =
+      points.length === 0
         ? globalMedian
-        : (sample.length * med + model.shrink_weight * globalMedian) / (sample.length + model.shrink_weight);
+        : (points.length * med + model.shrink_weight * globalMedian) / (points.length + model.shrink_weight);
+    const multiple = fit.kept
+      ? Math.exp(intercepts.get(cat)! + fit.slope * Math.log(model.reference_tvl_usd)) / model.reference_tvl_usd
+      : flat;
     categories.set(cat, {
       category: cat,
-      family: familyOf(cat === 'Uncategorized' ? null : cat),
+      family,
       kind,
-      n: sample.length,
+      n: points.length,
       median_ratio: round4(med),
       multiple: round4(multiple),
+      flat_multiple: round4(flat),
     });
   }
 
   return {
     reference_tvl_usd: model.reference_tvl_usd,
-    global_n: all.length,
+    global_n: comparable.length,
     global_median_ratio: round4(globalMedian),
-    global_multiple: round4(globalMedian),
+    global_multiple: round4(
+      fit.kept
+        ? Math.exp(fit.intercept + fit.slope * Math.log(model.reference_tvl_usd)) / model.reference_tvl_usd
+        : globalMedian,
+    ),
     categories,
+    curve: fit,
+    category_groups: categoryGroups,
+    family_groups: familyGroups,
+    all: comparable,
+    min_group: model.min_group,
   };
 }
 
 /** The comparable group one protocol is scored against, never absent: a missing category takes the market. */
+export function comparableGroup(p: SnapshotProtocol, book: PeerBook): SnapshotProtocol[] {
+  const cat = categoryKey(p);
+  const exact = book.category_groups.get(cat) ?? [];
+  if (exact.length >= book.min_group) return exact;
+  const family = book.family_groups.get(familyOf(p.category)) ?? [];
+  if (family.length >= book.min_group) return family;
+  return book.all;
+}
+
+/** The comparable multiple one protocol is scored against. */
 export function comparableFor(p: SnapshotProtocol, book: PeerBook): PeerComparable {
   const cat = categoryKey(p);
   const found = book.categories.get(cat);
@@ -444,29 +807,142 @@ export function comparableFor(p: SnapshotProtocol, book: PeerBook): PeerComparab
     n: book.global_n,
     median_ratio: book.global_median_ratio,
     multiple: book.global_multiple,
+    flat_multiple: book.global_median_ratio,
   };
 }
 
-/** The model's breakdown for one protocol: every multiplier that makes its implied value. */
+/** A category's or family's token rate: the share of its non-excluded protocols that record a token. */
+export interface GroupRate {
+  n: number;
+  rate: number;
+}
+
+export interface TokenOddsTable {
+  global: GroupRate;
+  categories: Map<string, GroupRate>;
+  families: Map<string, GroupRate>;
+  min_group: number;
+}
+
+/** The token rates the odds term reads, grouped by category and peer family. */
+export function buildTokenOddsTable(protocols: SnapshotProtocol[], minGroup: number = MODEL.min_group): TokenOddsTable {
+  const eligible = protocols.filter((p) => !isExcludedProduct(p));
+  const rate = (list: SnapshotProtocol[]): GroupRate => ({
+    n: list.length,
+    rate: list.length === 0 ? 0 : list.filter((p) => !isPreToken(p)).length / list.length,
+  });
+  const byCategory = new Map<string, SnapshotProtocol[]>();
+  const byFamily = new Map<string, SnapshotProtocol[]>();
+  for (const p of eligible) {
+    const cat = categoryKey(p);
+    const fam = familyOf(p.category);
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat)!.push(p);
+    if (!byFamily.has(fam)) byFamily.set(fam, []);
+    byFamily.get(fam)!.push(p);
+  }
+  const categories = new Map<string, GroupRate>();
+  const families = new Map<string, GroupRate>();
+  for (const [cat, list] of byCategory) categories.set(cat, rate(list));
+  for (const [fam, list] of byFamily) families.set(fam, rate(list));
+  return { global: rate(eligible), categories, families, min_group: minGroup };
+}
+
+/**
+ * Token odds: the category's (else family's, else market's) share of non-excluded protocols that already
+ * record a token, adjusted down for a long run with no token and slightly up for positive 7-day TVL
+ * change, clamped to [0.05, 0.95]. No name is consulted.
+ */
+export function tokenOdds(
+  p: SnapshotProtocol,
+  age: number | null,
+  table: TokenOddsTable,
+  model: ModelConstants = MODEL,
+): number {
+  const cat = categoryKey(p);
+  const c = table.categories.get(cat);
+  const f = table.families.get(familyOf(p.category));
+  let base = table.global.rate;
+  if (c !== undefined && c.n >= table.min_group) base = c.rate;
+  else if (f !== undefined && f.n >= table.min_group) base = f.rate;
+  const ageFraction = age === null ? 0 : Math.min(age, model.odds_age_days) / model.odds_age_days;
+  const momentumFraction = clamp(finite(p.change_7d, 0), 0, model.growth_cap) / model.growth_cap;
+  const adjusted = base * (1 - model.odds_age_penalty * ageFraction) * (1 + model.odds_momentum_boost * momentumFraction);
+  return round4(clamp(adjusted, model.odds_min, model.odds_max));
+}
+
+/** Own-token share: the shrunk median of mcap/(mcap+TVL) among the protocol's comparable group. */
+export function ownShare(p: SnapshotProtocol, book: PeerBook, model: ModelConstants = MODEL): number {
+  const shareOf = (q: SnapshotProtocol): number => q.mcap_usd! / (q.mcap_usd! + Math.max(1, q.tvl_usd));
+  const group = comparableGroup(p, book);
+  const med = group.length === 0 ? 0.5 : median(group.map(shareOf));
+  const globalMed = book.all.length === 0 ? 0.5 : median(book.all.map(shareOf));
+  const shrunk =
+    group.length === 0
+      ? globalMed
+      : (group.length * med + model.share_shrink_weight * globalMed) / (group.length + model.share_shrink_weight);
+  return round4(clamp(shrunk, model.share_min, model.share_max));
+}
+
+/** Where one implied value stands on the board: median and percentile (1 = highest, 0 = lowest). */
+export interface VerdictStanding {
+  median: number;
+  percentile: number;
+}
+
+/**
+ * The verdict rule (radar-3.1), stated in MODEL and repeated in every closing farm step:
+ *   FARM if token odds >= verdict_farm_min_odds (0.50) AND implied percentile >= verdict_farm_min_percentile (0.50);
+ *   SKIP if odds <= verdict_skip_max_odds (0.20) OR percentile <= verdict_skip_max_percentile (0.25);
+ *   THIN otherwise.
+ * The plan's $50-$500 capital is deliberately not an input: implied/capital is always in the thousands and
+ * says nothing about a row's standing among the board's 198 implied values.
+ */
+export function verdictFor(
+  impliedValueUsd: number,
+  odds: number,
+  standing: VerdictStanding,
+  model: ModelConstants = MODEL,
+): Verdict {
+  if (impliedValueUsd <= 0) return 'SKIP';
+  if (odds >= model.verdict_farm_min_odds && standing.percentile >= model.verdict_farm_min_percentile) return 'FARM';
+  if (odds <= model.verdict_skip_max_odds || standing.percentile <= model.verdict_skip_max_percentile) return 'SKIP';
+  return 'THIN';
+}
+
+/** The model's breakdown for one protocol: every factor that makes its implied value. */
 export interface ValueBreakdown {
   age_days: number | null;
   comparable: PeerComparable;
   size_factor: number;
+  curve_multiple: number;
   base_multiple: number;
   growth_pct: number;
   growth_multiplier: number;
   tenure_multiplier: number;
   reach_multiplier: number;
+  launch_value_usd: number;
+  token_odds: number;
+  own_share: number;
   implied_value_usd: number;
   implied_multiple: number;
 }
 
 /** Score one pre-token protocol, using only the snapshot's own figures and the peer book. */
-export function deriveValue(p: SnapshotProtocol, asOf: string, book: PeerBook, model: ModelConstants = MODEL): ValueBreakdown {
+export function deriveValue(
+  p: SnapshotProtocol,
+  asOf: string,
+  book: PeerBook,
+  odds: number,
+  share: number,
+  model: ModelConstants = MODEL,
+): ValueBreakdown {
   const age = ageDays(asOf, p.listed_at);
   const peer = comparableFor(p, book);
-  const sizeFactor = Math.pow(Math.max(1, p.tvl_usd) / model.reference_tvl_usd, -model.size_tilt);
-  const baseMultiple = clamp(peer.multiple * sizeFactor, model.ratio_floor, model.ratio_cap);
+  const sizeTilt = book.curve.kept ? book.curve.size_tilt : 0;
+  const sizeFactor = Math.pow(Math.max(1, p.tvl_usd) / model.reference_tvl_usd, -sizeTilt);
+  const curveMultiple = peer.multiple * sizeFactor;
+  const baseMultiple = clamp(curveMultiple, model.ratio_floor, model.ratio_cap);
 
   const growthPct = clamp(finite(p.change_7d, 0), model.growth_floor, model.growth_cap);
   const growthMultiplier = 1 + (growthPct / 100) * model.growth_weight;
@@ -479,20 +955,24 @@ export function deriveValue(p: SnapshotProtocol, asOf: string, book: PeerBook, m
   const chainCount = Math.max(1, Math.min(p.chains.length, model.reach_max_chains));
   const reachMultiplier = 1 + (chainCount - 1) * model.reach_weight;
 
-  const implied = Math.max(
-    1,
-    Math.round(p.tvl_usd * baseMultiple * growthMultiplier * tenureMultiplier * reachMultiplier),
-  );
+  const launch = p.tvl_usd * baseMultiple * growthMultiplier * tenureMultiplier * reachMultiplier;
+  const launchValue = Math.max(1, Math.round(launch));
+  // Multiply the stored, rounded launch so the page can recompute this exact dollar from row fields.
+  const implied = Math.max(1, Math.round(launchValue * odds * share));
 
   return {
     age_days: age,
     comparable: peer,
     size_factor: round4(sizeFactor),
+    curve_multiple: round4(curveMultiple),
     base_multiple: round4(baseMultiple),
     growth_pct: round4(growthPct),
     growth_multiplier: round4(growthMultiplier),
     tenure_multiplier: round4(tenureMultiplier),
     reach_multiplier: round4(reachMultiplier),
+    launch_value_usd: launchValue,
+    token_odds: round4(odds),
+    own_share: round4(share),
     implied_value_usd: implied,
     implied_multiple: round4(implied / Math.max(1, p.tvl_usd)),
   };
@@ -630,11 +1110,50 @@ function secondAction(p: SnapshotProtocol, capital: number, chain: string): stri
   return `Make a second, smaller deposit in a different ${name} pool or market on ${chain} and keep it for a full week.`;
 }
 
+/** A short dollar figure for the verdict line. */
+function usdShort(n: number): string {
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
+  return `$${Math.round(n)}`;
+}
+
+/** The closing step: the verdict and the two inputs that decide it (odds, implied standing), in words. */
+function verdictStep(
+  verdict: Verdict,
+  impliedValueUsd: number,
+  odds: number,
+  capital: number,
+  hold: number,
+  standing: VerdictStanding,
+  model: ModelConstants = MODEL,
+): FarmStep {
+  const multiple = impliedValueUsd / Math.max(1, standing.median);
+  const percentile = Math.round(standing.percentile * 100);
+  const lead =
+    verdict === 'FARM'
+      ? "FARM: the model's conviction case"
+      : verdict === 'THIN'
+        ? 'THIN: a small, timed probe'
+        : 'SKIP: recorded for coverage, not a recommendation';
+  const text = `Verdict ${lead}. Odds ${odds.toFixed(2)}; implied ${usdShort(impliedValueUsd)} is ${multiple.toFixed(2)}x the board median (${percentile}th percentile). Rule: FARM if odds >= ${model.verdict_farm_min_odds} and implied >= median; SKIP if odds <= ${model.verdict_skip_max_odds} or below the 25th percentile; else THIN. Plan asks for $${capital} over ${hold} days.`;
+  return { text, cost: `$${capital} of capital`, time: `${hold} days` };
+}
+
 /**
- * A protocol's farm plan: eight steps, each an action with a cost and a time. Every branch is decided
- * by the protocol's own record (category, chains, TVL, age), never by a hand-written list of names.
+ * A protocol's farm plan: eight concrete steps plus a closing verdict, each an action with a cost and a
+ * time. Every branch is decided by the protocol's own record (category, chains, TVL, age), never by a
+ * hand-written list of names.
  */
-export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmPlan(
+  p: SnapshotProtocol,
+  age: number | null,
+  verdict: Verdict = 'SKIP',
+  impliedValueUsd = 0,
+  odds = 0,
+  standing: VerdictStanding = { median: Math.max(1, impliedValueUsd), percentile: 0 },
+  model: ModelConstants = MODEL,
+): FarmStep[] {
   const chain = chainOf(p);
   const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
   const capital = capitalFor(p);
@@ -684,6 +1203,7 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: 'normal withdrawal gas, plus slippage on the exit',
       time: '15 minutes to review each week',
     },
+    verdictStep(verdict, impliedValueUsd, odds, capital, hold, standing, model),
   ];
 }
 
@@ -719,14 +1239,28 @@ export function rankableUniverse(snapshot: Snapshot, model: ModelConstants = MOD
 }
 
 /** Build the ranked board: 1..N, strongest implied value first, every farm plan attached. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; book: PeerBook } {
-  const book = buildPeerBook(snapshot.protocols, model);
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, curve?: SizeCurve): { board: BoardRow[]; book: PeerBook } {
+  const book = buildPeerBook(snapshot.protocols, model, curve);
   const watchlist = new Set(snapshot.watchlist);
-  const scored = rankableUniverse(snapshot, model).map((p) => ({ p, value: deriveValue(p, snapshot.as_of, book, model) }));
+  const oddsTable = buildTokenOddsTable(snapshot.protocols, model.min_group);
+  const scored = rankableUniverse(snapshot, model).map((p) => {
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    const odds = tokenOdds(p, age, oddsTable, model);
+    const share = ownShare(p, book, model);
+    return { p, odds, share, value: deriveValue(p, snapshot.as_of, book, odds, share, model) };
+  });
   scored.sort((a, b) => b.value.implied_value_usd - a.value.implied_value_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
 
+  // The verdict is a standing among these implied values: median and percentile by rank.
+  const values = scored.map((s) => s.value.implied_value_usd).sort((a, b) => a - b);
+  const boardMedian = median(values);
+  const n = scored.length;
+
   const board = scored.map((s, i) => {
-    const plan = farmPlan(s.p, s.value.age_days);
+    const capital = capitalFor(s.p);
+    const standing: VerdictStanding = { median: boardMedian, percentile: n <= 1 ? 1 : (n - 1 - i) / (n - 1) };
+    const verdict = verdictFor(s.value.implied_value_usd, s.odds, standing, model);
+    const plan = farmPlan(s.p, s.value.age_days, verdict, s.value.implied_value_usd, s.odds, standing, model);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -745,6 +1279,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
       age_days: s.value.age_days,
       implied_value_usd: s.value.implied_value_usd,
       implied_multiple: s.value.implied_multiple,
+      launch_value_usd: s.value.launch_value_usd,
+      verdict,
+      token_odds: s.value.token_odds,
+      own_share: s.value.own_share,
       comparables: {
         group: s.value.comparable.kind === 'market' ? 'Whole snapshot' : s.value.comparable.category,
         kind: s.value.comparable.kind,
@@ -753,12 +1291,17 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
         category_multiple: s.value.comparable.multiple,
         size_factor: s.value.size_factor,
         base_multiple: s.value.base_multiple,
+        flat_multiple: s.value.comparable.flat_multiple,
+        curve_multiple: s.value.curve_multiple,
+        size_curve_kept: book.curve.kept,
       },
       model: {
         growth_pct: s.value.growth_pct,
         growth_multiplier: s.value.growth_multiplier,
         tenure_multiplier: s.value.tenure_multiplier,
         reach_multiplier: s.value.reach_multiplier,
+        token_odds: s.value.token_odds,
+        own_share: s.value.own_share,
       },
       farm_steps: plan.map(stepText),
     };
@@ -789,7 +1332,7 @@ export function liveRows(snapshot: Snapshot, limit = 160): LiveRow[] {
 }
 
 /** The dashboard's compact row, with the structured plan instead of the joined strings. */
-function radarRow(row: BoardRow, p: SnapshotProtocol): RadarRow {
+function radarRow(row: BoardRow, p: SnapshotProtocol, standing: VerdictStanding, model: ModelConstants = MODEL): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -804,11 +1347,15 @@ function radarRow(row: BoardRow, p: SnapshotProtocol): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     implied_multiple: row.implied_multiple,
+    launch_value_usd: row.launch_value_usd,
+    verdict: row.verdict,
+    token_odds: row.token_odds,
+    own_share: row.own_share,
     watchlist: row.watchlist,
     below_floor: row.below_floor,
     comparables: row.comparables,
     model: row.model,
-    steps: farmPlan(p, row.age_days),
+    steps: farmPlan(p, row.age_days, row.verdict, row.implied_value_usd, row.token_odds, standing, model),
   };
 }
 
@@ -823,10 +1370,13 @@ function plainSource(source: string): string {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; book: PeerBook } {
-  const { board, book } = buildBoard(snapshot, model);
+  const { curve, validation } = validateSizeCurve(comparableProtocols(snapshot.protocols), model);
+  const { board, book } = buildBoard(snapshot, model, curve);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watchlist = new Set(snapshot.watchlist);
   const live = liveRows(snapshot);
+  const boardValues = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
+  const boardMedian = median(boardValues);
   const preToken = snapshot.protocols.filter(isPreToken);
   const tokenRecorded = snapshot.protocols.length - preToken.length;
   const tokenWithMcap = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0).length;
@@ -859,6 +1409,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       generated: 'token-radar sweep',
     },
     model,
+    validation,
     stats: {
       protocols: snapshot.protocols.length,
       watchlist: snapshot.watchlist.length,
@@ -873,7 +1424,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       categories: categories.length,
     },
     categories,
-    rows: board.map((row) => radarRow(row, index.get(row.slug)!)),
+    rows: board.map((row) => radarRow(row, index.get(row.slug)!, {
+      median: boardMedian,
+      percentile: board.length <= 1 ? 1 : (board.length - row.rank) / (board.length - 1),
+    })),
     live,
   };
   return { board, radar, book };
