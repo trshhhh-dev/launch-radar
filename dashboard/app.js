@@ -44,6 +44,18 @@ return (n*100).toFixed(1)+'%';
 function fmtFactor(n) {
 return (n===null||n===undefined||!isFinite(n))?'n/a':n.toFixed(3)+'×';
 }
+function fmtRate(n) {return (n===null||n===undefined||!isFinite(n))?'n/a':(n*100).toFixed(1)+'%';}
+function missText(n) {return n.toFixed(3)+'×';}
+function bandTicks(row) {
+var b=row.range;
+if (!b) return null;
+var lo=Math.max(2,Math.min(92,Math.round((b.q25+1.6)/3.2*100)));
+var hi=Math.max(lo+5,Math.min(98,Math.round((b.q75+1.6)/3.2*100)));
+return el('span',{class:'rangebar','aria-hidden':'true'},
+el('i',{style:'left:'+lo+'%;width:'+(hi-lo)+'%'}),
+el('u',{style:'left:50%'})
+);
+}
 function categoryOf(row) {return row.category||'Uncategorized';}
 function chainText(row) {
 var chains=row.chains||[];
@@ -93,7 +105,7 @@ if (params.get('dir')) state.dir=Number(params.get('dir'))<0?-1:1;
 if (params.get('p')) state.selected=params.get('p');
 if (state.tab!=='radar'&&state.tab!=='live'&&state.tab!=='method') state.tab='radar';
 if (['FARM','MARGINAL','SKIP'].indexOf(state.verdict)<0) state.verdict='all';
-var radarSorts=['implied','rank','name','category','tvl','growth','age','multiple','net'];
+var radarSorts=['implied','rank','name','category','tvl','growth','age','multiple','net','odds'];
 var liveSorts=['mcap','name','category','tvl','growth','age','mcap_tvl'];
 var allowed=state.tab==='live'?liveSorts:radarSorts;
 if (allowed.indexOf(state.sort)<0) state.sort=state.tab==='live'?'mcap':'implied';
@@ -149,6 +161,7 @@ if (key==='growth') return row.change_7d===null||row.change_7d===undefined?-Infi
 if (key==='age') return row.age_days===null||row.age_days===undefined?Infinity:row.age_days;
 if (key==='multiple') return row.implied_multiple;
 if (key==='net') return row.farm.net_per_hour;
+if (key==='odds') return row.odds.rate;
 if (key==='mcap') return row.mcap_usd;
 if (key==='mcap_tvl') return row.mcap_tvl;
 if (key==='rank') return row.rank||0;
@@ -164,12 +177,7 @@ return (a.rank||0)-(b.rank||0);
 });
 }
 function dial() {
-return el('span',{class:'dial','aria-hidden':'true'},
-el('span',{class:'sweep'}),
-el('span',{class:'blip b1'}),
-el('span',{class:'blip b2'}),
-el('span',{class:'blip b3'})
-);
+return el('span',{class:'dial','aria-hidden':'true'},el('span',{class:'sweep'}));
 }
 function masthead() {
 return el('header',{class:'masthead'},
@@ -178,18 +186,16 @@ dial(),
 el('div',null,
 el('div',{class:'eyebrow',text:'Pre-token launch desk / snapshot sweep'}),
 el('h1',null,'Token ',el('em',null,'Radar')),
-el('p',{class:'sub',text:'No-token records from the sealed snapshot, ranked by implied token value. Watchlist plus early rows; live tokens stay apart as comparables.'})
+el('p',{class:'sub',text:'No-token records from the sealed snapshot, ranked by implied value; live tokens stay apart as comparables.'})
 )
 ),
 el('div',{class:'mast-meta'},
 el('span',null,el('span',{class:'live-dot'}),'model ',el('b',{text:DATA.meta.model_version+' + held-out evidence'})),
 el('span',null,'snapshot ',el('b',{text:DATA.meta.as_of})),
-el('span',null,'source ',el('b',{text:DATA.meta.source})),
 el('span',null,el('b',{text:DATA.stats.ranked+' ranked · '+DATA.stats.live_count+' live'}))
 )
 );
 }
-function missText(n) {return n.toFixed(2)+'×';}
 function verifyBoard() {
 var rows=DATA.rows;
 var good=0;
@@ -208,29 +214,58 @@ watch:rows.filter(function (r) {return r.watchlist;}).length,
 ledger:L.ranked===rows.length&&L.ranked+L.token_records+L.excluded===L.total&&reasonSum===L.excluded
 };
 }
-function evidenceStrip() {
-var splits=DATA.evidence.splits;
-var loo=splits[0];
-var time=splits[1];
-var v=DATA.stats.farm_verdicts;
-var better=Math.round((1-loo.miss_model/loo.miss_flat)*100);
-var worse=loo.miss_model>loo.miss_core;
-var delta=Math.abs(Math.round((loo.miss_model/loo.miss_core-1)*1000)/10);
-var cards=[
-{k:'Flat category mcap/TVL · held-out miss',v:missText(loo.miss_flat),small:'LOO n='+loo.n,n:'Raw category median, no size term'},
-{k:'2.1 peer + size + factors · held-out miss',v:missText(loo.miss_model),small:better+'% below flat',n:'Target left out of its own peer set'},
-{k:'Time split · earlier peers price later',v:missText(time.miss_flat)+' → '+missText(time.miss_model),small:'n='+time.n,n:'Flat versus the same locked 2.1'},
-{k:'Net farm @ $10k · 12 weeks',v:'F '+v.FARM+' / M '+v.MARGINAL+' / S '+v.SKIP,small:'selective',n:'Gas and test tx netted out'}
-];
-return el('div',null,
-el('section',{class:'stats','aria-label':'Held-out evidence'},cards.map(function (c) {
-return el('div',{class:'stat'},
-el('div',{class:'k',text:c.k}),
-el('div',{class:'v'},c.v,el('small',{text:c.small})),
-el('div',{class:'n',text:c.n})
+function oddsTable(all) {
+var o=DATA.odds;
+var variants=all?o.variants:(o.variants.filter(function (v) {return v.name===o.chosen;}).concat(o.chosen?[]:o.variants.slice(0,1)));
+var flat={};
+DATA.evidence.splits.forEach(function (s) {flat[s.name]=s.miss_flat;});
+var body=el('tbody');
+variants.forEach(function (v) {
+v.splits.forEach(function (s,i) {
+body.appendChild(el('tr',null,
+el('td',{class:'variant',text:i===0?(all?v.name:(o.kept?'kept ':'tested ')+v.name):''}),
+el('td',{text:s.name==='leave-one-out'?'Leave-one-out':'Time split'}),
+el('td',{class:'num right',text:String(s.n)}),
+el('td',{class:'num right',text:missText(flat[s.name]||0)}),
+el('td',{class:'num right',text:missText(s.miss_2_1)}),
+el('td',{class:'num right multiple',text:missText(s.miss_odds)}),
+el('td',{class:'num right',text:((1-s.miss_odds/s.miss_2_1)*100).toFixed(1)+'% gain'})
+));
+});
+});
+return el('div',{class:'table-wrap oos-wrap'},
+el('table',{class:'oos'},
+el('caption',{class:'muted',style:'position:absolute;left:-9999px',text:'Held-out miss by listing-rate variant'}),
+el('thead',null,el('tr',null,
+el('th',{scope:'col',text:all?'Variant':'Test'}),el('th',{scope:'col',text:'Split'}),
+el('th',{scope:'col',class:'right',text:'n'}),el('th',{scope:'col',class:'right',text:'Flat'}),
+el('th',{scope:'col',class:'right',text:'2.1'}),el('th',{scope:'col',class:'right',text:'2.1×odds'}),
+el('th',{scope:'col',class:'right',text:'Odds gain'})
+)),body)
 );
-})),
-el('p',{class:'kept-line',text:'“Kept” = unchanged radar-2.1. Held out, momentum + tenure + reach miss '+delta+'% '+(worse?'worse':'better')+' than peer + size alone and stay locked. Miss = exp(mean |log(pred/mcap)|), lower better.'})
+}
+function evidenceStrip() {
+var o=DATA.odds;
+var r=DATA.range;
+var v=DATA.stats.farm_verdicts;
+var c=verifyBoard();
+var chosen=o.variants.find(function (x) {return x.name===o.chosen;})||o.variants[0];
+return el('section',{class:'evidence','aria-label':'Held-out evidence and display layers'},
+el('div',{class:'kpis'},
+el('span',null,'model ',el('b',{text:DATA.meta.model_version})),
+el('span',null,el('b',{text:String(DATA.stats.ranked)}),' ranked · ',el('b',{text:DATA.stats.watchlist_ranked+'/'+DATA.stats.watchlist}),' watchlist · ',el('b',{text:String(DATA.stats.early_rows)}),' early'),
+el('span',null,'ledger ',el('b',{text:String(DATA.ledger.total)}),c.ledger?' ✓':' ✗'),
+el('span',null,'farm F/M/S ',el('b',{text:v.FARM+' / '+v.MARGINAL+' / '+v.SKIP})),
+el('span',null,'P25–P75 ',el('b',{text:'×'+r.low_multiple.toFixed(2)+'–×'+r.high_multiple.toFixed(2)})),
+el('span',null,'listing ',el('b',{text:(o.chosen||'none')+' '+(o.kept?'kept':'tested')}))
+),
+el('div',{class:'evidence-body'},
+oddsTable(false),
+el('div',{class:'evidence-notes'},
+el('p',{text:'Band: P25–P75 of centred log residuals on '+r.n+' LOO comparables ×'+r.low_multiple.toFixed(2)+'–×'+r.high_multiple.toFixed(2)+'; pools n≥'+r.minimum_pool+'. Display only.'}),
+el('p',{text:'Listing rate (market '+fmtRate(o.global_rate)+'): '+chosen.name+' '+(o.kept?'kept after both tests':'tested, not kept')+'. No own-share.'})
+)
+)
 );
 }
 function ledgerStrip() {
@@ -426,16 +461,23 @@ el('td',{class:'chain hide-sm',text:chainText(row)}),
 el('td',{class:'num right',text:fmtUsd(row.tvl_usd)}),
 growthCell(row.change_7d),
 el('td',{class:'num hide-sm',text:fmtAge(row.age_days)}),
-el('td',{class:'num right multiple',text:fmtMult(row.implied_multiple)}),
+el('td',{class:'num right multiple hide-md',text:fmtMult(row.implied_multiple)}),
 el('td',{class:'farmcell'},
 el('div',{class:'farmtop'},verdictTag(row),el('b',{text:fmtSigned(row.farm.net_usd)})),
 el('div',{class:'muted',text:(row.farm.net_per_hour>=0?'+':'−')+'$'+Math.abs(row.farm.net_per_hour).toFixed(1)+'/h'})
 ),
-el('td',null,
+el('td',{class:'right impliedcell'},
 el('div',{class:'implied'},
 el('div',{class:'bar','aria-hidden':'true'},el('i',{style:'width:'+width+'%'})),
 el('b',{text:fmtUsd(row.implied_value_usd)})
 )
+),
+el('td',{class:'rangecell',title:row.range?('P25–P75, '+row.range.source+' n='+row.range.n):'No usable residual band'},
+row.range?el('div',null,bandTicks(row),el('b',{text:fmtUsd(row.range.low)+'–'+fmtUsd(row.range.high)})):el('span',{class:'muted',text:'no band'})
+),
+el('td',{class:'odds',title:(row.odds.group+' group n='+row.odds.n+' · market '+fmtRate(row.odds.global_rate))},
+el('b',{text:fmtRate(row.odds.rate)}),
+el('div',{class:'muted',text:'×'+row.odds.multiplier.toFixed(2)+(row.odds.kept?' kept':' test')})
 )
 );
 body.appendChild(tr);
@@ -446,7 +488,7 @@ el('div',null,
 el('h2',{text:'The pre-token board'}),
 el('p',{text:list.length+' of '+DATA.rows.length+' ranked pre-token protocols · strongest implied value first · net farm on a $10k ticket'})
 ),
-el('p',{class:'muted',style:'text-align:right;max-width:34ch',text:'Watchlist rows are the floor; the early rows below it are the point of the radar.'})
+null
 ),
 el('div',{class:'model-strip','aria-label':'Value model'},
 el('span',{class:'eq-label',text:'Locked radar-2.1'}),
@@ -466,9 +508,11 @@ sortHeader('category','Category','hide-sm'),
 sortHeader('tvl','TVL','hide-sm'),
 sortHeader('growth','7d'),
 sortHeader('age','Age','hide-sm'),
-sortHeader('multiple','Value / TVL','right'),
+sortHeader('multiple','Value / TVL','right hide-md'),
 sortHeader('net','Net farm','right'),
-sortHeader('implied','Implied value','right')
+sortHeader('implied','Implied value','right'),
+el('th',{scope:'col',class:'right',text:'P25–P75'}),
+sortHeader('odds','List rate','right')
 )),
 body
 )
@@ -501,7 +545,7 @@ el('div',null,
 el('h2',{text:'Token already trades'}),
 el('p',{text:list.length+' live comparables by market cap · these are facts, not forecasts, and never enter the pre-token rank'})
 ),
-el('p',{class:'muted',style:'text-align:right;max-width:38ch',text:'Their market-cap / TVL multiple is the raw input to the peer book on the Method tab.'})
+el('p',{class:'muted',style:'text-align:right;max-width:30ch',text:'Their mcap/TVL is the raw input to the peer book.'})
 ),
 el('div',{class:'table-wrap'},
 el('table',null,
@@ -534,38 +578,9 @@ onclick:function () {state.q='';state.cat='all';state.chain='all';state.scope='a
 })
 ));
 }
-function heldOutCard() {
-var splits=DATA.evidence.splits;
-var rows=splits.map(function (s) {
-return el('tr',null,
-el('td',null,el('b',{text:s.name==='leave-one-out'?'Leave-one-out':'Time split'}),el('div',{class:'family',text:s.name==='leave-one-out'?'target removed from every peer set':'only strictly earlier listed peers, at least six'})),
-el('td',{class:'num right',text:String(s.n)}),
-el('td',{class:'num right',text:s.miss_flat.toFixed(3)+'×'}),
-el('td',{class:'num right',text:s.miss_core.toFixed(3)+'×'}),
-el('td',{class:'num right multiple',text:s.miss_model.toFixed(3)+'×'}),
-el('td',{class:'num right',text:Math.round((1-s.miss_model/s.miss_flat)*100)+'% below flat'})
-);
-});
-var loo=splits[0];
-var delta=Math.abs(Math.round((loo.miss_model/loo.miss_core-1)*1000)/10);
-return el('section',{class:'card heldout'},
-el('h2',{text:'Held-out evidence · recomputed from the sealed snapshot'}),
-el('p',{text:'Each token-bearing protocol is scored against peers that exclude it. Flat = raw category mcap/TVL median (family/market fallback), no size term; 2.1 = unchanged peer book and deriveValue on that reduced set. '+DATA.evidence.metric+'.'}),
-el('div',{class:'table-wrap'},
-el('table',null,
-el('thead',null,el('tr',null,
-el('th',{scope:'col',text:'Split'}),
-el('th',{scope:'col',class:'right',text:'n'}),
-el('th',{scope:'col',class:'right',text:'Flat miss'}),
-el('th',{scope:'col',class:'right',text:'Peer + size'}),
-el('th',{scope:'col',class:'right',text:'Full 2.1'}),
-el('th',{scope:'col',class:'right',text:'2.1 vs flat'})
-)),
-el('tbody',null,rows)
-)
-),
-el('p',{class:'note',text:'2.1 beats flat out of sample; momentum + tenure + reach miss '+delta+'% '+(loo.miss_model>loo.miss_core?'more':'less')+' than peer + size alone but stay locked. No split statistic feeds back into a rank.'})
-);
+function coreLine() {
+var s=DATA.evidence.splits;
+return el('p',{class:'note',text:'Peer + size miss LOO '+s[0].miss_core.toFixed(3)+'× / time '+s[1].miss_core.toFixed(3)+'× versus full 2.1 '+s[0].miss_model.toFixed(3)+'× / '+s[1].miss_model.toFixed(3)+'×; momentum, tenure and reach stay locked.'});
 }
 function methodView() {
 var m=DATA.model;
@@ -575,7 +590,8 @@ var equation=el('div',{class:'equation'},
 'size tilt = (TVL / $100M) ^ -'+m.size_tilt+'\n',
 'momentum = 1 + clamp(change_7d, '+m.growth_floor+', '+m.growth_cap+') / 100 × '+m.growth_weight+'\n',
 'tenure = '+m.tenure_floor+' + min(age_days, '+m.tenure_days+') / '+m.tenure_days+' × '+m.tenure_range+'\n',
-'reach = 1 + (min(chains, '+m.reach_max_chains+') - 1) × '+m.reach_weight
+'reach = 1 + (min(chains, '+m.reach_max_chains+') - 1) × '+m.reach_weight+'\n',
+'listing multiplier = '+(DATA.odds.kept?DATA.odds.chosen+' × rate ratio, kept after both tests':'tested, not kept; multiplier = 1')
 );
 var factors=el('dl',{class:'factors'},
 el('div',{class:'factor'},el('dt',{text:'Peer multiple'}),el('dd',{text:'Median mcap/TVL of token-bearing same-category peers at $100M TVL; thin categories borrow family, then market.'})),
@@ -605,11 +621,17 @@ el('td',{class:'num right',text:String(c.ranked_count)})
 );
 });
 return el('div',null,
-heldOutCard(),
+coreLine(),
+el('section',{class:'card heldout','aria-label':'Listing-rate test and residual band'},
+el('h2',{text:'Listing-rate layer · tested on both held-out splits'}),
+el('p',{text:DATA.odds.note+' Market rate '+fmtRate(DATA.odds.global_rate)+' across '+DATA.odds.n_comparables+' comparables, '+DATA.odds.parameters.odds_alpha+' pseudo-observations.'}),
+oddsTable(true),
+el('p',{class:'note',text:'Band: '+DATA.range.metric+'. n='+DATA.range.n+', centred P25–P75 ×'+DATA.range.low_multiple.toFixed(3)+'–×'+DATA.range.high_multiple.toFixed(3)+'; '+DATA.range.pools.length+' pools n≥'+DATA.range.minimum_pool+'. Display only.'})
+),
 el('div',{class:'method'},
 el('section',{class:'card'},
 el('h2',{text:'The value model'}),
-el('p',{text:'One function scores every row from TVL, 7d growth, listing age, category peers and chain count. No name is special-cased.'}),
+el('p',{text:'One function scores every row from the snapshot. No name is special-cased.'}),
 equation,
 factors
 ),
@@ -641,10 +663,7 @@ el('tbody',null,peerRows)
 )
 )
 ),
-el('div',{class:'card',style:'margin-top:16px'},
-el('h2',{text:'How to read a row'}),
-el('p',{text:'Open any row for its factor arithmetic, recompute check and eight-step costed plan; the plan follows the row\'s category, chains, TVL and age.'})
-)
+null
 );
 }
 function comp(label,value,suffix) {
@@ -675,7 +694,7 @@ var age=row.age_days===null||row.age_days===undefined
 ?m.unknown_age_factor
 :m.tenure_floor+(Math.min(row.age_days,m.tenure_days)/m.tenure_days)*m.tenure_range;
 var reach=1+(Math.max(1,Math.min((row.chains||[]).length,m.reach_max_chains))-1)*m.reach_weight;
-return Math.max(1,Math.round(row.tvl_usd*base*growth*age*reach));
+return Math.max(1,Math.round(row.tvl_usd*base*growth*age*reach*row.odds.multiplier));
 }
 function netFarmBox(row) {
 var f=row.farm;
@@ -701,7 +720,7 @@ dialog.textContent='';
 var model=DATA.model;
 var c=row.comparables;
 var check=recompute(row);
-var formula=fmtUsd(row.tvl_usd)+' × '+fmtMult(c.base_multiple)+' × '+fmtFactor(row.model.growth_multiplier)+' × '+fmtFactor(row.model.tenure_multiplier)+' × '+fmtFactor(row.model.reach_multiplier)+' = '+fmtUsd(row.implied_value_usd);
+var formula=fmtUsd(row.tvl_usd)+' × '+fmtMult(c.base_multiple)+' × '+fmtFactor(row.model.growth_multiplier)+' × '+fmtFactor(row.model.tenure_multiplier)+' × '+fmtFactor(row.model.reach_multiplier)+' × odds '+fmtFactor(row.odds.multiplier)+' = '+fmtUsd(row.implied_value_usd);
 var peers=DATA.live.filter(function (p) {return categoryOf(p)===categoryOf(row);});
 if (peers.length<3) {
 var familyPeers=DATA.live.filter(function (p) {return p.family===row.family&&peers.indexOf(p)<0;});
@@ -726,6 +745,11 @@ el('div',{class:'big-value'},
 el('b',{text:fmtUsd(row.implied_value_usd)}),
 el('span',{text:'implied value · '+fmtMult(row.implied_multiple)+' of TVL · model '+DATA.meta.model_version})
 ),
+el('div',{class:'range-line'},
+bandTicks(row),
+el('b',{text:row.range?fmtUsd(row.range.low)+'–'+fmtUsd(row.range.high):'no band'}),
+el('span',{text:'P25–P75'+(row.range?' · '+row.range.source+' n='+row.range.n:' · no usable residual scatter')})
+),
 el('div',{class:'formula-line'},el('b',{text:formula})),
 el('div',{class:'detail-grid'},
 el('div',{class:'detail-left'},
@@ -738,6 +762,9 @@ decomp('Base multiple',fmtMult(c.base_multiple),'peer × size'),
 decomp('7d momentum',fmtPct(row.change_7d),fmtFactor(row.model.growth_multiplier)),
 decomp('Tenure',fmtAge(row.age_days),fmtFactor(row.model.tenure_multiplier)),
 decomp('Reach',(row.chains||[]).length+' chain(s)',fmtFactor(row.model.reach_multiplier)),
+decomp('Listing rate',fmtRate(row.odds.rate),row.odds.group+' n='+row.odds.n+' · market '+fmtRate(row.odds.global_rate)),
+decomp('Odds multiplier',fmtFactor(row.odds.multiplier),row.odds.variant+' · '+(row.odds.kept?'kept after both tests':'tested, not kept')),
+decomp('P25–P75 range',row.range?fmtUsd(row.range.low)+'–'+fmtUsd(row.range.high):'no band',row.range?row.range.source+' n='+row.range.n:'no usable residual scatter'),
 decomp('Implied value',fmtUsd(row.implied_value_usd),'model claim, not a price'),
 decomp('Page recompute',fmtUsd(check),check===row.implied_value_usd?'matches board.json':'differs from board.json')
 ),
@@ -749,7 +776,7 @@ netFarmBox(row)
 el('div',{class:'detail-right'},
 el('section',{class:'section'},
 el('h3',{text:'Costed farm plan'}),
-el('p',{text:'Eight costed, timed steps; action from category, deposit/gas/hold from TVL, chains and age. Use official apps only.'}),
+el('p',{text:'Eight costed steps from category, TVL, chains and age. Official apps only.'}),
 el('div',{class:'plan-summary'},
 el('b',{text:(row.steps||[]).length+' steps'}),
 ' · every step priced and timed · hold ',
@@ -791,7 +818,7 @@ el('td',{class:'num right multiple',text:fmtMult(p.mcap_tvl)})
 )
 )
 ),
-el('div',{class:'disclaimer',text:'A model, not a price or a promise. TVL can leave and contracts can fail; verify official docs and size for total loss.'})
+el('div',{class:'disclaimer',text:'A model, not a price or a promise. Verify official docs and size for total loss.'})
 ));
 if (typeof dialog.showModal==='function') {
 if (!dialog.open) dialog.showModal();
@@ -819,7 +846,7 @@ else if (state.tab==='live') shell.appendChild(liveTable());
 else shell.appendChild(methodView());
 shell.appendChild(el('footer',null,
 el('span',null,el('b',{text:'Token Radar '+DATA.meta.model_version}),' · snapshot '+DATA.meta.as_of+' · '+DATA.stats.ranked+' pre-token rows · '+DATA.stats.live_count+' live comparables'),
-el('span',{text:'No network · every figure in this page comes from the sealed snapshot · an estimate, not a price'})
+el('span',{text:'No network · every figure from the sealed snapshot · an estimate, not a price'})
 ));
 app.appendChild(shell);
 app.setAttribute('aria-busy','false');

@@ -144,6 +144,25 @@ const splits = radar.evidence.splits;
 if (splits.length !== 2 || splits.some((s) => s.n === 0 || !Number.isFinite(s.miss_flat) || !Number.isFinite(s.miss_model))) {
   fail('the held-out comparison has an empty or non-finite split');
 }
+// The display-only layers must be real held-out statistics, not decoration.
+const odds = radar.odds;
+if (odds.variants.length === 0 || odds.variants.some((v) => v.splits.length !== 2 ||
+    v.splits.some((s) => s.n === 0 || !Number.isFinite(s.miss_2_1) || !Number.isFinite(s.miss_odds)))) {
+  fail('the listing-rate comparison has an empty or non-finite split');
+}
+const eligible = odds.variants.filter((v) => v.splits.every((s) => s.miss_odds < s.miss_2_1));
+if (odds.kept !== (eligible.length > 0) ||
+    (odds.kept && (odds.chosen === null || !eligible.some((v) => v.name === odds.chosen))) ||
+    radar.rows.some((r) => r.odds.kept !== odds.kept || !Number.isFinite(r.odds.multiplier) || r.odds.multiplier <= 0)) {
+  fail('the kept listing-rate term disagrees with its own held-out test');
+}
+const range = radar.range;
+if (range.n === 0 || !Number.isFinite(range.low_multiple) || !Number.isFinite(range.high_multiple) ||
+    range.low_multiple <= 0 || range.high_multiple < range.low_multiple ||
+    radar.rows.some((r) => r.range !== null && (!Number.isFinite(r.range.low) ||
+      !Number.isFinite(r.range.high) || r.range.low > r.range.high))) {
+  fail('the residual band is empty or non-finite');
+}
 const verdicts = radar.stats.farm_verdicts;
 if (verdicts.FARM === 0 || verdicts.MARGINAL === 0 || verdicts.SKIP === 0 || verdicts.FARM > board.length / 2) {
   fail(`the farm verdicts are not selective: ${JSON.stringify(verdicts)}`);
@@ -173,6 +192,7 @@ for (const rel of dashboardFiles) {
 }
 if (dashboardFiles.length > DASHBOARD_CAPS.max_files) fail(`dashboard/ holds ${dashboardFiles.length} files, over ${DASHBOARD_CAPS.max_files}`);
 if (dashboardBytes > DASHBOARD_CAPS.max_bytes) fail(`dashboard/ is ${dashboardBytes} bytes, over ${DASHBOARD_CAPS.max_bytes}`);
+if (dashboardBytes > 62_000) fail(`dashboard/ is ${dashboardBytes} bytes, over the entry's own 62000-byte budget`);
 if (!dashboardFiles.includes('index.html')) fail('dashboard/ has no index.html');
 if (!dashboardFiles.some((f) => f.toLowerCase().endsWith('.css'))) fail('dashboard/ has no .css file');
 if (!dashboardFiles.some((f) => f.toLowerCase().endsWith('.js'))) fail('dashboard/ has no .js file');
@@ -239,5 +259,21 @@ process.stdout.write(
 process.stdout.write(`token radar: boardIssue ${issue === null ? 'null' : issue}; dashboard source ${dashboardBytes} bytes (cap 62000)\n`);
 process.stdout.write(`token radar: held-out ${splits.map((s) => `${s.name} n=${s.n} flat ${s.miss_flat}× vs 2.1 ${s.miss_model}× (core ${s.miss_core}×)`).join(' | ')}\n`);
 process.stdout.write(`token radar: ledger ${ledger.ranked}+${ledger.token_records}+${ledger.excluded}=${ledger.total}; excluded by reason ${ledger.reasons.map((r) => `${r.reason} ${r.count}`).join(', ')}\n`);
+process.stdout.write('token radar: out-of-sample miss, exp(mean |log(pred/mcap)|), lower is better\n');
+process.stdout.write(`  ${'variant'.padEnd(24)} ${'LOO 2.1'.padStart(9)} ${'LOO ×odds'.padStart(10)} ${'time 2.1'.padStart(10)} ${'time ×odds'.padStart(11)}  kept\n`);
+for (const variant of odds.variants) {
+  const loo = variant.splits.find((s) => s.name === 'leave-one-out')!;
+  const time = variant.splits.find((s) => s.name === 'time')!;
+  const isKept = odds.kept && odds.chosen === variant.name;
+  process.stdout.write(
+    `  ${variant.name.padEnd(24)} ${loo.miss_2_1.toFixed(4).padStart(9)} ${loo.miss_odds.toFixed(4).padStart(10)} ` +
+      `${time.miss_2_1.toFixed(4).padStart(10)} ${time.miss_odds.toFixed(4).padStart(11)}  ${isKept ? 'YES' : 'no'}\n`,
+  );
+}
+process.stdout.write(
+  `token radar: listing-rate ${odds.chosen ?? 'none'} ${odds.kept ? 'kept' : 'tested, not kept'} on ${odds.n_comparables} comparables, ` +
+    `market rate ${(odds.global_rate * 100).toFixed(1)}% · P25–P75 band from ${range.n} locked-2.1 LOO residuals ` +
+    `×${range.low_multiple.toFixed(3)}–×${range.high_multiple.toFixed(3)} (${range.pools.length} deep pools, n≥${range.minimum_pool})\n`,
+);
 process.stdout.write(`token radar: farm verdicts FARM ${verdicts.FARM} / MARGINAL ${verdicts.MARGINAL} / SKIP ${verdicts.SKIP} ($${radar.rows[0]!.farm.deposit_usd} ticket)\n`);
 process.stdout.write(`token radar: screenshots ${shotSizes.join(' · ')}\n`);

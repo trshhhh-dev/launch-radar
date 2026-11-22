@@ -95,6 +95,21 @@ export const FARM_ECONOMICS = {
   hourly_rate_usd: 25,
 };
 
+/**
+ * The listing-rate layer and the display band. Both are derived only from the sealed snapshot and
+ * the locked 2.1 score; neither is a fitted curve and neither reads a protocol's name.
+ */
+export const DISPLAY_TERMS = {
+  odds_alpha: 4,
+  odds_group_min: 8,
+  odds_ratio_floor: 0.4,
+  odds_ratio_cap: 2.5,
+  odds_shrink: 0.5,
+  odds_multiplier_floor: 0.6,
+  odds_multiplier_cap: 1.6,
+  band_pool_min: 12,
+};
+
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
   text: string;
@@ -120,6 +135,27 @@ export interface PeerBook {
   global_median_ratio: number;
   global_multiple: number;
   categories: Map<string, PeerComparable>;
+}
+
+/** The row's listing-rate context: the share of token-bearing peers, and whether its multiplier was kept. */
+export interface OddsTerm {
+  rate: number;
+  global_rate: number;
+  multiplier: number;
+  group: 'category' | 'family' | 'market';
+  n: number;
+  kept: boolean;
+  variant: string;
+}
+
+/** A display-only P25–P75 band around one implied value, from held-out residual scatter. */
+export interface RangeBand {
+  q25: number;
+  q75: number;
+  low: number;
+  high: number;
+  source: string;
+  n: number;
 }
 
 /** One row of board.json: the ranked board's row, with its model breakdown. */
@@ -156,6 +192,8 @@ export interface BoardRow {
     tenure_multiplier: number;
     reach_multiplier: number;
   };
+  odds: OddsTerm;
+  range: RangeBand | null;
   farm_steps: string[];
 }
 
@@ -194,6 +232,8 @@ export interface RadarRow {
   below_floor: boolean;
   comparables: BoardRow['comparables'];
   model: BoardRow['model'];
+  odds: OddsTerm;
+  range: RangeBand | null;
   steps: FarmStep[];
   farm: FarmEconomics;
 }
@@ -227,6 +267,48 @@ export interface HeldOutSplit {
 export interface HeldOutEvidence {
   metric: string;
   splits: HeldOutSplit[];
+}
+
+/** One listing-rate variant's out-of-sample result on one split. */
+export interface OddsSplit {
+  name: HeldOutSplit['name'];
+  n: number;
+  miss_2_1: number;
+  miss_odds: number;
+}
+
+/** A listing-rate variant, with both held-out tests and the average gain. */
+export interface OddsVariant {
+  name: string;
+  description: string;
+  splits: OddsSplit[];
+  gain_pct: number;
+}
+
+/** The whole tested odds layer. A term is kept only if it lowers miss on BOTH splits. */
+export interface OddsEvidence {
+  metric: string;
+  parameters: typeof DISPLAY_TERMS;
+  global_rate: number;
+  n_comparables: number;
+  variants: OddsVariant[];
+  kept: boolean;
+  chosen: string | null;
+  note: string;
+}
+
+/** The residual scatter behind the display band. */
+export interface RangeEvidence {
+  metric: string;
+  source: string;
+  n: number;
+  q25: number;
+  q50: number;
+  q75: number;
+  low_multiple: number;
+  high_multiple: number;
+  minimum_pool: number;
+  pools: Array<{ group: string; n: number; q25: number; q50: number; q75: number }>;
 }
 
 /** The 758-protocol accounting: ranked + token-bearing + excluded, with each exclusion reason. */
@@ -265,6 +347,8 @@ export interface RadarData {
     farm_verdicts: { FARM: number; MARGINAL: number; SKIP: number };
   };
   evidence: HeldOutEvidence;
+  odds: OddsEvidence;
+  range: RangeEvidence;
   ledger: ProtocolLedger;
   farm_terms: {
     deposit_usd: number;
@@ -323,6 +407,16 @@ function median(values: number[]): number {
   const lo = Math.floor(mid);
   const hi = Math.ceil(mid);
   return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (mid - lo);
+}
+
+/** A linear-interpolated quantile of a sorted-able list; null for an empty list. */
+function quantile(values: number[], q: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const at = (sorted.length - 1) * q;
+  const lo = Math.floor(at);
+  const hi = Math.ceil(at);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
 }
 
 /** Whole days from `listed_at` to `as_of`, clamped at zero; null when either date is absent or bad. */
@@ -837,11 +931,21 @@ export function rankableUniverse(snapshot: Snapshot, model: ModelConstants = MOD
 }
 
 /** Build the ranked board: 1..N, strongest implied value first, every farm plan attached. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; book: PeerBook } {
+export function buildBoard(
+  snapshot: Snapshot,
+  model: ModelConstants = MODEL,
+  odds: OddsEvidence = oddsEvidence(snapshot, model),
+  range: RangeEvidence = rangeEvidence(snapshot, model),
+): { board: BoardRow[]; book: PeerBook } {
   const book = buildPeerBook(snapshot.protocols, model);
   const watchlist = new Set(snapshot.watchlist);
-  const scored = rankableUniverse(snapshot, model).map((p) => ({ p, value: deriveValue(p, snapshot.as_of, book, model) }));
-  scored.sort((a, b) => b.value.implied_value_usd - a.value.implied_value_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const scored = rankableUniverse(snapshot, model).map((p) => {
+    const value = deriveValue(p, snapshot.as_of, book, model);
+    const term = oddsFor(p, snapshot.protocols.filter((q) => q.slug !== p.slug), odds);
+    const implied = Math.max(1, Math.round(value.implied_value_usd * term.multiplier));
+    return { p, value, term, implied };
+  });
+  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
 
   const board = scored.map((s, i) => {
     const plan = farmPlan(s.p, s.value.age_days);
@@ -861,8 +965,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
       watchlist: watchlist.has(s.p.slug),
       below_floor: s.p.tvl_usd < snapshot.floor_usd,
       age_days: s.value.age_days,
-      implied_value_usd: s.value.implied_value_usd,
-      implied_multiple: s.value.implied_multiple,
+      implied_value_usd: s.implied,
+      implied_multiple: round4(s.implied / Math.max(1, s.p.tvl_usd)),
       comparables: {
         group: s.value.comparable.kind === 'market' ? 'Whole snapshot' : s.value.comparable.category,
         kind: s.value.comparable.kind,
@@ -878,6 +982,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
         tenure_multiplier: s.value.tenure_multiplier,
         reach_multiplier: s.value.reach_multiplier,
       },
+      odds: s.term,
+      range: bandFor(s.implied, categoryKey(s.p), familyOf(s.p.category), range),
       farm_steps: plan.map(stepText),
     };
   });
@@ -961,6 +1067,214 @@ export function heldOutEvidence(snapshot: Snapshot, model: ModelConstants = MODE
   };
 }
 
+/** A token with a usable market price is a listing; a token record without one is not. */
+function isListed(p: SnapshotProtocol): boolean {
+  return p.mcap_usd !== null && p.mcap_usd > 0;
+}
+
+/**
+ * The plain listing rate: the share of token-bearing protocols in the target's category, borrowing
+ * its family and then the market when a group is thin, shrunk by four pseudo-observations toward
+ * that same universe's market rate. The target itself is always outside `universe`, so a score never
+ * sees its own listing status. Every count comes from the sealed snapshot.
+ */
+function listingRate(target: SnapshotProtocol, universe: SnapshotProtocol[]): { rate: number; global_rate: number; group: OddsTerm['group']; n: number } {
+  const cats = universe.filter((p) => categoryKey(p) === categoryKey(target));
+  const fams = universe.filter((p) => familyOf(p.category) === familyOf(target.category));
+  let pool = cats;
+  let group: OddsTerm['group'] = 'category';
+  if (pool.length < DISPLAY_TERMS.odds_group_min) {
+    pool = fams;
+    group = 'family';
+  }
+  if (pool.length < DISPLAY_TERMS.odds_group_min) {
+    pool = universe;
+    group = 'market';
+  }
+  const globalRate = Math.max(0.01, universe.filter(isListed).length / Math.max(1, universe.length));
+  const rate = (pool.filter(isListed).length + DISPLAY_TERMS.odds_alpha * globalRate) / (pool.length + DISPLAY_TERMS.odds_alpha);
+  return { rate, global_rate: globalRate, group, n: pool.length };
+}
+
+/** The three obvious listing-rate multipliers. All are shrunk toward 1 and clamped to ±60%. */
+function multiplierFor(rate: number, globalRate: number, variant: string | null): number {
+  const d = DISPLAY_TERMS;
+  const ratio = clamp(rate / Math.max(globalRate, 0.01), d.odds_ratio_floor, d.odds_ratio_cap);
+  const bounds = (n: number): number => clamp(n, d.odds_multiplier_floor, d.odds_multiplier_cap);
+  if (variant === 'linear') return bounds(1 + d.odds_shrink * (rate - globalRate));
+  if (variant === 'ratio') return bounds(1 + d.odds_shrink * (ratio - 1));
+  if (variant === 'sqrt') return bounds(Math.sqrt(ratio));
+  return 1;
+}
+
+/** One row's listing context; the multiplier is 1 unless a variant survived both held-out tests. */
+function oddsFor(target: SnapshotProtocol, universe: SnapshotProtocol[], evidence: OddsEvidence): OddsTerm {
+  const l = listingRate(target, universe);
+  const multiplier = evidence.kept ? round4(multiplierFor(l.rate, l.global_rate, evidence.chosen)) : 1;
+  return {
+    rate: round4(l.rate),
+    global_rate: round4(l.global_rate),
+    multiplier,
+    group: l.group,
+    n: l.n,
+    kept: evidence.kept,
+    variant: evidence.chosen ?? 'none',
+  };
+}
+
+/** The same target and peer sets the held-out evidence already uses, plus each target's full universe. */
+function heldOutSpecs(snapshot: Snapshot): Array<{
+  name: HeldOutSplit['name'];
+  targets: SnapshotProtocol[];
+  peersOf: (t: SnapshotProtocol) => SnapshotProtocol[];
+  universeOf: (t: SnapshotProtocol) => SnapshotProtocol[];
+}> {
+  const comparable = snapshot.protocols.filter(isComparable);
+  const dated = comparable
+    .filter((p) => p.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : 1));
+  return [
+    {
+      name: 'leave-one-out',
+      targets: comparable,
+      peersOf: (t) => comparable.filter((p) => p.slug !== t.slug),
+      universeOf: (t) => snapshot.protocols.filter((p) => p.slug !== t.slug),
+    },
+    {
+      name: 'time',
+      targets: dated,
+      peersOf: (t) => dated.filter((p) => p.listed_at! < t.listed_at!),
+      universeOf: (t) => snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at! < t.listed_at!),
+    },
+  ];
+}
+
+/** Test three listing-rate multipliers on both held-out splits; keep only one that wins on both. */
+export function oddsEvidence(snapshot: Snapshot, model: ModelConstants = MODEL): OddsEvidence {
+  const specs = heldOutSpecs(snapshot);
+  const definitions = [
+    { name: 'linear', description: '1 + 0.5 × (group listing rate − market rate)' },
+    { name: 'ratio', description: '1 + 0.5 × (clamped group/market rate ratio − 1)' },
+    { name: 'sqrt', description: 'sqrt(clamped group/market rate ratio)' },
+  ];
+  const variants: OddsVariant[] = definitions.map((definition) => {
+    const splits: OddsSplit[] = specs.map((spec) => {
+      let base = 0;
+      let odds = 0;
+      let n = 0;
+      for (const target of spec.targets) {
+        const peers = spec.peersOf(target);
+        if (peers.length < model.shrink_weight) continue;
+        const value = deriveValue(target, snapshot.as_of, buildPeerBook(peers, model), model);
+        const log = Math.log(value.implied_value_usd / target.mcap_usd!);
+        const l = listingRate(target, spec.universeOf(target));
+        base += Math.abs(log);
+        odds += Math.abs(log + Math.log(multiplierFor(l.rate, l.global_rate, definition.name)));
+        n += 1;
+      }
+      return {
+        name: spec.name,
+        n,
+        miss_2_1: round4(Math.exp(base / n)),
+        miss_odds: round4(Math.exp(odds / n)),
+      };
+    });
+    const gain = splits.reduce((sum, s) => sum + (1 - s.miss_odds / s.miss_2_1) * 100, 0) / splits.length;
+    return { name: definition.name, description: definition.description, splits, gain_pct: Math.round(gain * 100) / 100 };
+  });
+  const eligible = variants.filter((v) => v.splits.every((s) => s.miss_odds < s.miss_2_1));
+  const chosen = eligible.length === 0 ? null : eligible.reduce((a, b) => (a.gain_pct >= b.gain_pct ? a : b)).name;
+  const all = snapshot.protocols;
+  return {
+    metric: 'exp of mean |log(predicted / market cap)|, lower is better',
+    parameters: DISPLAY_TERMS,
+    global_rate: round4(all.filter(isListed).length / Math.max(1, all.length)),
+    n_comparables: all.filter(isComparable).length,
+    variants,
+    kept: chosen !== null,
+    chosen,
+    note: chosen === null
+      ? 'No listing-rate variant lowered miss on both held-out splits: tested, not kept. Implied values are the locked radar-2.1 product.'
+      : `Listing rate ${chosen} lowered miss on both held-out splits: kept as a multiplier on the locked radar-2.1 product. No own-share and no fitted curve; farm verdicts still use the unchanged net-on-$10k rule.`,
+  };
+}
+
+/** Locked-2.1 residuals of the live comparables, each left out of its own peer set. */
+function heldOutResiduals(snapshot: Snapshot, model: ModelConstants = MODEL): Array<{ category: string; family: string; log: number }> {
+  const comparable = snapshot.protocols.filter(isComparable);
+  const out: Array<{ category: string; family: string; log: number }> = [];
+  for (const target of comparable) {
+    const peers = comparable.filter((p) => p.slug !== target.slug);
+    if (peers.length < model.shrink_weight) continue;
+    const value = deriveValue(target, snapshot.as_of, buildPeerBook(peers, model), model);
+    out.push({
+      category: categoryKey(target),
+      family: familyOf(target.category),
+      log: Math.log(target.mcap_usd! / value.implied_value_usd),
+    });
+  }
+  return out;
+}
+
+/** P25–P75 of log(actual / predicted) under the locked model, centred on the pool's median before it is wrapped around an implied value. */
+export function rangeEvidence(snapshot: Snapshot, model: ModelConstants = MODEL): RangeEvidence {
+  const residuals = heldOutResiduals(snapshot, model);
+  const logs = residuals.map((r) => r.log);
+  const q25 = quantile(logs, 0.25);
+  const q50 = quantile(logs, 0.5);
+  const q75 = quantile(logs, 0.75);
+  const byCat = new Map<string, number[]>();
+  const byFam = new Map<string, number[]>();
+  for (const r of residuals) {
+    if (!byCat.has(r.category)) byCat.set(r.category, []);
+    byCat.get(r.category)!.push(r.log);
+    const key = `family ${r.family}`;
+    if (!byFam.has(key)) byFam.set(key, []);
+    byFam.get(key)!.push(r.log);
+  }
+  const pools: Array<{ group: string; n: number; q25: number; q50: number; q75: number }> = [];
+  for (const [group, values] of [...byCat, ...byFam]) {
+    if (values.length < DISPLAY_TERMS.band_pool_min) continue;
+    const lo = quantile(values, 0.25);
+    const mid = quantile(values, 0.5);
+    const hi = quantile(values, 0.75);
+    if (lo !== null && mid !== null && hi !== null) pools.push({ group, n: values.length, q25: lo, q50: mid, q75: hi });
+  }
+  pools.sort((a, b) => b.n - a.n || (a.group < b.group ? -1 : 1));
+  return {
+    metric: 'P25–P75 of log(actual / locked-2.1 implied), leave-one-out live comparables, centred on the pool median',
+    source: 'same held-out residuals as the evidence table; no row is scored by its own residual',
+    n: residuals.length,
+    q25: q25 ?? 0,
+    q50: q50 ?? 0,
+    q75: q75 ?? 0,
+    low_multiple: Math.exp((q25 ?? 0) - (q50 ?? 0)),
+    high_multiple: Math.exp((q75 ?? 0) - (q50 ?? 0)),
+    minimum_pool: DISPLAY_TERMS.band_pool_min,
+    pools,
+  };
+}
+
+/** The band a row displays: its category's residuals when deep enough, else family, else the whole scatter. */
+function bandFor(implied: number, category: string, family: string, evidence: RangeEvidence): RangeBand | null {
+  if (evidence.n === 0) return null;
+  const pool =
+    evidence.pools.find((p) => p.group === category && p.n >= evidence.minimum_pool) ??
+    evidence.pools.find((p) => p.group === `family ${family}` && p.n >= evidence.minimum_pool) ??
+    null;
+  const q25 = (pool ? pool.q25 : evidence.q25) - (pool ? pool.q50 : evidence.q50);
+  const q75 = (pool ? pool.q75 : evidence.q75) - (pool ? pool.q50 : evidence.q50);
+  if (!Number.isFinite(q25) || !Number.isFinite(q75)) return null;
+  return {
+    q25: round4(q25),
+    q75: round4(q75),
+    low: Math.max(1, Math.round(implied * Math.exp(q25))),
+    high: Math.max(1, Math.round(implied * Math.exp(q75))),
+    source: pool ? pool.group : 'global',
+    n: pool ? pool.n : evidence.n,
+  };
+}
+
 /** The dashboard's compact row, with the structured plan instead of the joined strings. */
 function radarRow(row: BoardRow, p: SnapshotProtocol): RadarRow {
   const plan = farmPlan(p, row.age_days);
@@ -982,6 +1296,8 @@ function radarRow(row: BoardRow, p: SnapshotProtocol): RadarRow {
     below_floor: row.below_floor,
     comparables: row.comparables,
     model: row.model,
+    odds: row.odds,
+    range: row.range,
     steps: plan,
     farm: netFarmEconomics(p, row.implied_value_usd, row.age_days, plan),
   };
@@ -998,7 +1314,9 @@ function plainSource(source: string): string {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; book: PeerBook } {
-  const { board, book } = buildBoard(snapshot, model);
+  const odds = oddsEvidence(snapshot, model);
+  const range = rangeEvidence(snapshot, model);
+  const { board, book } = buildBoard(snapshot, model, odds, range);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watchlist = new Set(snapshot.watchlist);
   const live = liveRows(snapshot);
@@ -1067,6 +1385,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       farm_verdicts: farmVerdicts,
     },
     evidence: heldOutEvidence(snapshot, model),
+    odds,
+    range,
     ledger,
     farm_terms: FARM_ECONOMICS,
     categories,
